@@ -58,6 +58,7 @@ use sandbox_driver_protocol::discovery::PluginConfig;
 use sandbox_driver_protocol::{PluginGeneration, PluginSupervisor};
 use tokio::sync::OnceCell;
 
+use crate::registration::RegistrationError;
 use crate::{DOCKER_HOST_ALIAS, fingerprint};
 
 /// The naming prefix plugin discovery searches `PATH` for:
@@ -150,6 +151,9 @@ pub struct PluginSettings {
     path:         Option<PathBuf>,
     sha256:       Option<String>,
     dev:          bool,
+    /// Arguments the executable is launched with. Only an explicit
+    /// registration supplies any.
+    args:         Vec<String>,
     host_address: Option<String>,
     env:          BTreeMap<String, String>,
     /// A non-secret description of the backend the plugin will drive, from
@@ -167,6 +171,7 @@ impl fmt::Debug for PluginSettings {
             .field("path", &self.path)
             .field("sha256", &self.sha256)
             .field("dev", &self.dev)
+            .field("argument_count", &self.args.len())
             .field("host_address", &self.host_address)
             .field("env_keys", &self.env.keys())
             .field("fingerprint", &self.fingerprint)
@@ -212,8 +217,45 @@ impl PluginSettings {
             path,
             sha256,
             dev,
+            args: Vec::new(),
             host_address,
             env,
+            fingerprint,
+        })
+    }
+
+    /// Settings frozen as `config` gives them, for a registered plugin: an
+    /// absolute executable, its arguments and complete environment, and a
+    /// checksum or an explicit development opt-in. Nothing is read from this
+    /// process's environment, and nothing is looked for on `PATH`.
+    pub(crate) fn explicit(config: PluginConfig) -> Result<Self, RegistrationError> {
+        let invalid = RegistrationError::Launch;
+        let path = config
+            .path
+            .as_ref()
+            .ok_or(invalid("an executable path is required"))?;
+        if !path.is_absolute() {
+            return Err(invalid("the executable path must be absolute"));
+        }
+        if !config.inherit_env.is_empty() {
+            return Err(invalid(
+                "the environment must be complete; nothing is inherited from this process",
+            ));
+        }
+        if config.sha256.is_none() && !config.dev {
+            return Err(invalid(
+                "a sha256 checksum is required unless development mode is explicit",
+            ));
+        }
+        let fingerprint = fingerprint_for(config.kind.as_str(), &config.env);
+        Ok(Self {
+            kind: config.kind,
+            path: config.path,
+            sha256: config.sha256,
+            dev: config.dev,
+            args: config.args,
+            host_address: None,
+            env: config.env,
             fingerprint,
         })
     }
@@ -295,6 +337,7 @@ impl PluginSettings {
             config.dev = true;
         }
         config.env.clone_from(&self.env);
+        config.args.clone_from(&self.args);
         Ok(config)
     }
 }

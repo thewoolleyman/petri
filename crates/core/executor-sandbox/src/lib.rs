@@ -35,6 +35,7 @@ pub mod lease;
 pub mod plugin;
 #[cfg(test)]
 mod reconcile_tests;
+mod registration;
 mod routing;
 mod run;
 mod simulated;
@@ -75,6 +76,7 @@ pub use crate::lease::{
     ReconcileReport, RecordedLease, SandboxLeaseManager,
 };
 pub use crate::plugin::{FixedProvider, PluginError, PluginSettings, PluginSource, ProviderSource};
+pub use crate::registration::{ProviderRegistrations, RegistrationError};
 pub use crate::routing::{CONTAINER_KIND, RoutingExecutor};
 use crate::run::workspace_dir;
 pub use crate::run::{LEASE_LABEL, RUN_LABEL, RunIdentity, WORKSPACE_LABEL};
@@ -112,6 +114,9 @@ pub struct SandboxExecutor {
     retention:    Retention,
     host_address: Option<String>,
     options:      SandboxOptions,
+    /// A registered provider's template: every process scope is built
+    /// from it. Built-in kinds have none and use their own recipes.
+    process_spec: Option<SandboxSpec>,
     snapshots:    RunnerSnapshots,
     /// Every scope is realized on the [`SimulatedProvider`], whatever its
     /// target: a bare spec, no host-process semantics, no route back.
@@ -140,9 +145,70 @@ impl SandboxExecutor {
             retention,
             host_address,
             options,
+            process_spec: None,
             snapshots: RunnerSnapshots::default(),
             simulated: false,
             gate: RunGate::default(),
+        }
+    }
+
+    /// Build every process scope from `template`: a registered provider's.
+    #[must_use]
+    pub(crate) fn with_process_spec(mut self, template: SandboxSpec) -> Self {
+        self.process_spec = Some(template);
+        self
+    }
+
+    /// A registered provider's template describes one ordinary process
+    /// sandbox. A container target, services, or placement requirements
+    /// need a recipe Petri has only for its built-in kinds, so a scope
+    /// asking for any of them is refused before the provider is reached.
+    fn validate_scope(&self, scope: &ScopeSpec) -> Result<(), EnvError> {
+        if self.process_spec.is_none() {
+            return Ok(());
+        }
+        let refused = match &scope.runtime.target {
+            RuntimeTarget::Container { .. } => Some("a container target"),
+            RuntimeTarget::HostProcess if !scope.services.is_empty() => Some("services"),
+            RuntimeTarget::HostProcess if !scope.runtime.requirements.is_empty() => {
+                Some("placement requirements")
+            }
+            RuntimeTarget::HostProcess => None,
+        };
+        match refused {
+            Some(what) => {
+                let kind = self.manager.source().kind();
+                Err(EnvError::backend(
+                    kind,
+                    "acquire",
+                    format!(
+                        "the {kind} provider runs ordinary process scopes only; this scope asks for {what}"
+                    ),
+                ))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The policy this run's sandboxes are created with. A registered
+    /// provider's template may fix one and the run may ask for one; when
+    /// both do, they must agree, since neither refines the other.
+    fn network_policy(&self) -> Result<NetworkPolicy, EnvError> {
+        let requested = &self.options.network;
+        let Some(template) = &self.process_spec else {
+            return Ok(requested.clone());
+        };
+        match (&template.network, requested) {
+            (policy, NetworkPolicy::ProviderDefault) | (NetworkPolicy::ProviderDefault, policy) => {
+                Ok(policy.clone())
+            }
+            (template, requested) if template == requested => Ok(requested.clone()),
+            _ => Err(EnvError::backend(
+                self.manager.source().kind(),
+                "acquire",
+                "the run's network policy differs from the registered provider's template; ask for \
+                 the template's policy or the provider default",
+            )),
         }
     }
 
@@ -195,6 +261,9 @@ impl SandboxExecutor {
             None => (SandboxLeaseId::new(u64::from(scope.id.raw())), true),
         };
         let name = self.identity.container_name(lease);
+        self.validate_scope(scope)?;
+        let network = self.network_policy()?;
+        let created_with = network.clone();
         let acquired = self
             .manager
             .acquire(
@@ -208,7 +277,7 @@ impl SandboxExecutor {
                         .build_spec(scope, &labels, &name, ctx, &*provider)
                         .await?;
                     if !self.simulated {
-                        spec.network = self.options.network.clone();
+                        spec.network = created_with;
                     }
                     Ok(spec)
                 },
@@ -217,7 +286,7 @@ impl SandboxExecutor {
         let sandbox = acquired.sandbox();
         // A retained sandbox may predate the requested block policy. Check
         // provider state before handing it to hooks or executing any stage.
-        if !self.simulated && self.options.network == NetworkPolicy::Block {
+        if !self.simulated && network == NetworkPolicy::Block {
             let status = sandbox
                 .describe()
                 .await
@@ -287,14 +356,21 @@ impl SandboxExecutor {
             lease,
             standalone,
         };
-        Ok(EnvHandle::new(
+        let handle = EnvHandle::new(
             scope.id,
             SmolStr::new(scope.environment.as_str()),
             instance,
             Arc::new(env),
             teardown,
-        )
-        .with_runner(Arc::new(runner)))
+        );
+        // A registered provider's template is for process scopes alone: no
+        // Docker actions run in its sandboxes, so no runner is attached, and
+        // an action step fails with the executor's own clear error.
+        Ok(if self.process_spec.is_some() {
+            handle
+        } else {
+            handle.with_runner(Arc::new(runner))
+        })
     }
 
     /// The record of an acquired sandbox: its provider and id, and what the
@@ -337,6 +413,20 @@ impl SandboxExecutor {
                 .name(name)
                 .working_directory(format!("/{SIMULATED_KIND}/{}", scope.workspace_id));
             spec.labels.extend(labels.iter().cloned());
+            return Ok(spec);
+        }
+        if let Some(template) = &self.process_spec {
+            // The registration's template, as given, under Petri's name and
+            // labels, with the scope's environment over the template's.
+            let mut spec = template.clone();
+            spec.name = Some(name.to_owned());
+            spec.labels.extend(labels.iter().cloned());
+            spec.env.extend(
+                scope
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string())),
+            );
             return Ok(spec);
         }
         if self.options.backend == SandboxBackend::Host

@@ -21,7 +21,7 @@ use crate::in_process::{
     InProcessProviders, InProcessSource, ProviderContext, ProviderFactory, ProviderNetwork,
 };
 use crate::plugin::ProviderSource;
-use crate::routing::{ProviderRegistrations, ProviderTransport};
+use crate::registration::{ProviderRegistrations, ProviderTransport};
 use crate::{DOCKER_HOST_ALIAS, RUN_LABEL, fingerprint};
 
 /// A provider with a scripted kind and health report; it creates nothing.
@@ -277,7 +277,7 @@ fn linked_factories_serve_the_kind_they_build_and_nothing_else() {
         .get("docker")
         .err()
         .expect("no docker factory, and no plugin in its place");
-    assert!(missing.contains("not configured"), "{missing}");
+    assert!(missing.contains("not registered"), "{missing}");
     assert!(
         matches!(
             providers.get("daytona"),

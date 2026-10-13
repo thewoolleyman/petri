@@ -951,19 +951,26 @@ impl Reader<'_> {
             .and_then(toml::Value::as_str)
             .unwrap_or("")
             .to_string();
-        if !matches!(provider.as_str(), "local" | "docker" | "daytona") {
+        // `local`, `docker` and `daytona` are the providers Petri places
+        // itself; any other valid kind names a provider the host registers,
+        // and is carried through as written. `simulated` is a dry run's.
+        if provider == "simulated"
+            || sandbox_driver::ProviderKind::try_new(provider.as_str()).is_err()
+        {
             let source = at(&format!("{base_table}.provider"));
             self.unsupported_in(
                 &source,
                 "workflow_toml.environments.provider",
                 format!(
                     "`[environments.{id}] provider = \"{provider}\"` in `{source}` is not \
-                     `local`, `docker` or `daytona`"
+                     `local`, `docker`, `daytona`, or a provider kind (lowercase letters, \
+                     digits, and interior hyphens)"
                 ),
-                "set the provider to `local`, `docker` or `daytona`",
+                "set the provider to `local`, `docker`, `daytona`, or a registered provider kind",
             );
             return;
         }
+        let built_in = matches!(provider.as_str(), "local" | "docker" | "daytona");
         // A field, with the table it was read from: the run's own table
         // over the named environment's.
         let field = |key: &str| {
@@ -972,6 +979,25 @@ impl Reader<'_> {
                 .map(|value| (value, "run.environment"))
                 .or_else(|| base.get(key).map(|value| (value, base_table.as_str())))
         };
+        // A registered provider is provisioned from its registration's
+        // template; the keys that size or image a built-in provider's
+        // sandbox would be ignored, so they are refused instead.
+        if !built_in {
+            for key in ["image", "resources"] {
+                if let Some((_, table)) = field(key) {
+                    self.unsupported_in(
+                        &at(&format!("{table}.{key}")),
+                        "workflow_toml.environments.custom",
+                        format!(
+                            "`[environments.{id}] provider = \"{provider}\"` is a registered \
+                             provider; `{key}` applies to `docker` and `daytona` only"
+                        ),
+                        "configure the provider's sandbox in its registration instead",
+                    );
+                    return;
+                }
+            }
+        }
         let mut environment = Environment {
             id:        id.clone(),
             provider:  provider.clone(),

@@ -38,6 +38,14 @@ local composite actions; no network (remote action resolution is package 04).
 This is what makes the package property-testable and what keeps GHA's
 peculiarities from leaking into the engine.
 
+A sandbox provider selection is a validated provider kind, not a closed set:
+`local` means the host, `docker` and `daytona` their plugins, and any other
+valid kind a provider the host registers. A frontend carries the name through
+as written and never maps an unknown one to the host; the runtime decides
+whether it is registered. A registered provider runs ordinary process scopes
+from its registration's template, so a frontend refuses the image and resource
+settings that would size a built-in provider's sandbox under it.
+
 Every frontend emits diagnostics through one shared type:
 
 ```rust

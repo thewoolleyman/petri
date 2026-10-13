@@ -22,6 +22,7 @@ executor = { workspace = true }
 executor-sandbox = { workspace = true }
 sandbox-driver = { workspace = true }
 sandbox-driver-host = { workspace = true }
+sandbox-driver-protocol = { workspace = true }
 steps = { workspace = true }
 driver = { workspace = true }
 async-trait = { workspace = true }

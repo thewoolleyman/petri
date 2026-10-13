@@ -1,7 +1,8 @@
 //! An [`Executor`] that routes each scope to the provider its placement
-//! needs: one [`SandboxExecutor`] per provider kind, over the kind's plugin
-//! or a built-in linked into this process through [`InProcessProviders`],
-//! or over the in-process [`SimulatedProvider`] for a dry run. It is the
+//! needs: one [`SandboxExecutor`] per provider kind, over the kind's plugin,
+//! a built-in linked into this process through [`InProcessProviders`], or a
+//! plugin registered for a custom kind ([`ProviderRegistrations`]), or over
+//! the in-process [`SimulatedProvider`] for a dry run. It is the
 //! composition the runtime registers for a run.
 
 use std::collections::BTreeMap;
@@ -21,11 +22,10 @@ use tokio::sync::OnceCell;
 
 use crate::actions::{ActionHost, ActionHostRunner, remove_recorded};
 use crate::gate::{DRAIN_BUDGET, RunGate};
-use crate::in_process::{
-    InProcessProviders, InProcessSource, ProviderContext, ProviderFactory, ProviderNetwork,
-};
+use crate::in_process::{InProcessProviders, InProcessSource, ProviderContext, ProviderNetwork};
 use crate::lease::{LeaseLedger, MemoryLedger, ReconcileReport, RecordedLease};
 use crate::plugin::{FixedProvider, PluginSettings, PluginSource, ProviderSource};
+use crate::registration::{ProviderRegistrations, ProviderTransport};
 use crate::run::{RunIdentity, workspace_dir};
 use crate::simulated::{SIMULATED_KIND, SimulatedProvider};
 use crate::{SandboxBackend, SandboxExecutor, SandboxOptions, SandboxTeardown};
@@ -41,57 +41,6 @@ const HOST_KIND: &str = "host";
 enum ActionOwner {
     Lease(SandboxLeaseId),
     Scope(ir::ScopeId),
-}
-
-/// How one provider kind is reached.
-#[derive(Clone)]
-pub(crate) enum ProviderTransport {
-    /// A built-in provider linked into this process.
-    Linked(Arc<dyn ProviderFactory>),
-    /// The kind's plugin, configured from this process's environment on
-    /// first use.
-    EnvPlugin,
-}
-
-/// The provider kinds a router can reach, and how. A kind with no entry
-/// fails routably at acquire; nothing is launched in its place.
-#[derive(Clone, Default)]
-pub(crate) struct ProviderRegistrations {
-    entries: BTreeMap<String, ProviderTransport>,
-}
-
-impl ProviderRegistrations {
-    /// Standalone Petri's: the Host, Docker, and Daytona plugins, each
-    /// configured from the environment when first used.
-    fn standalone() -> Self {
-        Self {
-            entries: [HOST_KIND, CONTAINER_KIND, "daytona"]
-                .into_iter()
-                .map(|kind| (kind.to_owned(), ProviderTransport::EnvPlugin))
-                .collect(),
-        }
-    }
-
-    /// Only the built-in providers linked in `providers`: a kind with no
-    /// factory has no entry, so no plugin is launched in its place.
-    pub(crate) fn linked(providers: InProcessProviders) -> Self {
-        Self {
-            entries: providers
-                .into_factories()
-                .into_iter()
-                .map(|(kind, factory)| (kind, ProviderTransport::Linked(factory)))
-                .collect(),
-        }
-    }
-
-    pub(crate) fn get(&self, kind: &str) -> Result<&ProviderTransport, String> {
-        self.entries.get(kind).ok_or_else(|| {
-            format!(
-                "the {kind} provider is not configured for this run, and no provider plugin is \
-                 launched in its place"
-            )
-        })
-    }
 }
 
 /// One provider kind as this run reaches it: its executor, and how its
@@ -230,8 +179,17 @@ impl RoutingExecutor {
     /// and still takes its Host scopes here; a simulated router reaches no
     /// provider at all.
     #[must_use]
-    pub fn with_in_process(mut self, providers: InProcessProviders) -> Self {
-        self.providers = ProviderRegistrations::linked(providers);
+    pub fn with_in_process(self, providers: InProcessProviders) -> Self {
+        self.with_providers(ProviderRegistrations::linked(providers))
+    }
+
+    /// Reach exactly the providers `providers` registers: linked built-ins,
+    /// first-party plugins, and plugins registered for custom kinds. A kind
+    /// with no entry fails routably at acquire; no plugin is launched in
+    /// its place.
+    #[must_use]
+    pub fn with_providers(mut self, providers: ProviderRegistrations) -> Self {
+        self.providers = providers;
         self
     }
 
@@ -319,9 +277,10 @@ impl RoutingExecutor {
         }
         match &self.fixed {
             Some(source) => source.kind(),
-            None => match self.options.backend {
+            None => match &self.options.backend {
                 SandboxBackend::Host | SandboxBackend::Docker => CONTAINER_KIND,
                 SandboxBackend::Daytona => "daytona",
+                SandboxBackend::Registered(kind) => kind.as_str(),
             },
         }
     }
@@ -417,38 +376,53 @@ impl RoutingExecutor {
         } else {
             None
         };
-        let (source, network): (Arc<dyn ProviderSource>, ProviderNetwork) = match transport {
-            ProviderTransport::Linked(factory) => {
-                let network = factory.network();
-                let context = ProviderContext::new(
-                    self.identity.run_id(),
-                    self.identity.run_dir(),
-                    host_registry,
-                );
-                (
-                    Arc::new(InProcessSource::new(factory.clone(), context)),
-                    network,
-                )
-            }
-            ProviderTransport::EnvPlugin => {
-                let settings = PluginSettings::from_env(kind, self.options.plugin_dev)
-                    .map_err(|error| error.to_string())?;
-                if let Some(directory) = host_registry {
-                    (
-                        Arc::new(PluginSource::new(settings.with_host_registry(&directory))),
-                        ProviderNetwork::from_parts(Ok(Some("127.0.0.1".to_owned())), false),
-                    )
-                } else {
-                    let network = ProviderNetwork::from_parts(
-                        settings.host_address().map_err(|error| error.to_string()),
-                        settings.supports_host_workspace(),
+        let (source, network, process_spec): (Arc<dyn ProviderSource>, ProviderNetwork, _) =
+            match transport {
+                ProviderTransport::Linked(factory) => {
+                    let network = factory.network();
+                    let context = ProviderContext::new(
+                        self.identity.run_id(),
+                        self.identity.run_dir(),
+                        host_registry,
                     );
-                    (Arc::new(PluginSource::new(settings)), network)
+                    (
+                        Arc::new(InProcessSource::new(factory.clone(), context)),
+                        network,
+                        None,
+                    )
                 }
-            }
-        };
+                ProviderTransport::EnvPlugin => {
+                    let settings = PluginSettings::from_env(kind, self.options.plugin_dev)
+                        .map_err(|error| error.to_string())?;
+                    if let Some(directory) = host_registry {
+                        (
+                            Arc::new(PluginSource::new(settings.with_host_registry(&directory))),
+                            ProviderNetwork::from_parts(Ok(Some("127.0.0.1".to_owned())), false),
+                            None,
+                        )
+                    } else {
+                        let network = ProviderNetwork::from_parts(
+                            settings.host_address().map_err(|error| error.to_string()),
+                            settings.supports_host_workspace(),
+                        );
+                        (Arc::new(PluginSource::new(settings)), network, None)
+                    }
+                }
+                // A registered provider's sandboxes have no route back to
+                // this machine and mount no Host workspace: ordinary
+                // process scopes need neither.
+                ProviderTransport::Plugin(plugin) => (
+                    Arc::new(PluginSource::new(plugin.settings.clone())),
+                    ProviderNetwork::from_parts(Ok(None), false),
+                    Some(plugin.process_spec.clone()),
+                ),
+            };
+        let mut executor = self.executor_over(source, ledger, &network)?;
+        if let Some(template) = process_spec {
+            executor = executor.with_process_spec(template);
+        }
         Ok(Arc::new(Bound {
-            executor: Arc::new(self.executor_over(source, ledger, &network)?),
+            executor: Arc::new(executor),
             network,
         }))
     }
@@ -675,12 +649,29 @@ impl RoutingExecutor {
 
 #[async_trait]
 impl Executor for RoutingExecutor {
+    /// A scope goes where its placement puts it, unless its lease is
+    /// already recorded on a provider: then it goes back there, whatever
+    /// the run is configured for now, so a resume reaches the sandbox the
+    /// lease holds. A dry run places every scope on the simulated provider.
     async fn acquire(
         &self,
         scope: &ScopeSpec,
         ctx: &AcquireContext,
     ) -> Result<EnvHandle, EnvError> {
-        let kind = self.provider_kind_for(&scope.runtime);
+        let recorded = match ctx.lease() {
+            Some(lease) if !self.simulated => self.recorded_provider(lease).await?,
+            _ => None,
+        };
+        let kind = recorded
+            .as_deref()
+            .unwrap_or_else(|| self.provider_kind_for(&scope.runtime));
+        if kind == SIMULATED_KIND && !self.simulated {
+            return Err(EnvError::backend(
+                SIMULATED_KIND,
+                "acquire",
+                "the lease was simulated by a dry run; no provider holds it",
+            ));
+        }
         if kind != HOST_KIND {
             return self
                 .executor(kind)

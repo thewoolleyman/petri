@@ -158,7 +158,7 @@ async fn a_kind_without_a_factory_fails_at_acquire_instead_of_launching_its_plug
         .acquire(&scope, &AcquireContext::bare())
         .await
         .expect_err("no Docker factory");
-    assert!(error.to_string().contains("not configured"), "{error}");
+    assert!(error.to_string().contains("not registered"), "{error}");
 
     // Host scopes still run: the missing kind is only needed by containers.
     let env = router

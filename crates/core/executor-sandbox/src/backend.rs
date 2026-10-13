@@ -7,12 +7,14 @@ use std::str::FromStr;
 
 use executor::EnvError;
 use ir::RuntimeSpec;
-use sandbox_driver::{NetworkPolicy, Resources, SandboxKind};
+use sandbox_driver::{NetworkPolicy, ProviderKind, Resources, SandboxKind};
+
+use crate::registration::selectable_kind;
 
 const RUNNER_PIN: &str = "f8bbbfd81934";
 const DEFAULT_LABEL: &str = "ubuntu-24.04";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SandboxBackend {
     /// Local processes, with Docker for explicit container targets.
     #[default]
@@ -21,6 +23,10 @@ pub enum SandboxBackend {
     Docker,
     /// A Daytona sandbox, with a nested job container when requested.
     Daytona,
+    /// Ordinary process scopes on a provider registered under this kind
+    /// (`ProviderRegistrations`). Any valid kind but a reserved name parses
+    /// to this arm; whether it is registered is decided at acquire.
+    Registered(ProviderKind),
 }
 
 impl fmt::Display for SandboxBackend {
@@ -29,6 +35,7 @@ impl fmt::Display for SandboxBackend {
             Self::Host => "host",
             Self::Docker => "docker",
             Self::Daytona => "daytona",
+            Self::Registered(kind) => kind.as_str(),
         })
     }
 }
@@ -41,9 +48,9 @@ impl FromStr for SandboxBackend {
             "host" => Ok(Self::Host),
             "docker" => Ok(Self::Docker),
             "daytona" => Ok(Self::Daytona),
-            _ => Err(format!(
-                "unknown backend {value:?}; expected host, docker, or daytona"
-            )),
+            _ => selectable_kind(value)
+                .map(Self::Registered)
+                .map_err(|error| error.to_string()),
         }
     }
 }
@@ -214,6 +221,16 @@ mod tests {
             target:       RuntimeTarget::HostProcess,
             requirements: labels.iter().map(|label| (*label).into()).collect(),
         }
+    }
+
+    #[test]
+    fn any_valid_kind_but_a_reserved_name_selects_a_registered_provider() {
+        let backend: SandboxBackend = "fixture-provider".parse().expect("a valid kind");
+        assert_eq!(backend.to_string(), "fixture-provider");
+        assert_eq!("host".parse::<SandboxBackend>(), Ok(SandboxBackend::Host));
+        assert!("../plugin".parse::<SandboxBackend>().is_err());
+        assert!("local".parse::<SandboxBackend>().is_err());
+        assert!("simulated".parse::<SandboxBackend>().is_err());
     }
 
     #[test]

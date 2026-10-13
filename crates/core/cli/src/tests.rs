@@ -30,9 +30,10 @@ fn daytona_options(command: &str, flags: &[&str]) -> SandboxOptions {
             Path::new("run"),
             None,
             &LaunchSettings::default(),
-            provider,
+            &provider,
             runner,
         )
+        .expect("valid launch options")
         .sandbox
 }
 
