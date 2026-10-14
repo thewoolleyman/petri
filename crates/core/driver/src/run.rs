@@ -455,6 +455,13 @@ enum Signal {
         scope:  ScopeId,
         result: Result<(), ObserveError>,
     },
+    /// An attempt's `StepStarted` record is in the run log, or the run log
+    /// failed to store it.
+    StartStored {
+        firing:  FiringId,
+        attempt: Attempt,
+        result:  Result<(), ObserveError>,
+    },
     /// The host's `before_attempt` answered; the resolver runs next when it
     /// admitted.
     HookAdmitted {
@@ -701,6 +708,9 @@ pub struct Driver {
     slot:             ExecutionSlot,
     /// Attempts waiting for a slot, with the task that awaits it.
     gated:            BTreeMap<FiringId, GatedStart>,
+    /// Attempts whose `StepStarted` is in the log and waiting to be durable
+    /// before they start, with the task that awaits it.
+    storing_starts:   BTreeMap<FiringId, GatedStart>,
     /// Deliveries that arrived before execution admission resolved. Unlike
     /// [`Forward`], every buffered delivery carries an ack.
     early_deliveries: BTreeMap<FiringId, Vec<(Control, DeliverAck)>>,
@@ -776,6 +786,7 @@ impl Drop for Driver {
             task.workers.abort_all();
         }
         self.gated.clear();
+        self.storing_starts.clear();
         self.rx.close();
         let (_, empty) = mpsc::channel(1);
         let mut signals = mem::replace(&mut self.rx, empty);
@@ -946,6 +957,7 @@ impl Driver {
             attempt_slots: None,
             slot: ExecutionSlot::empty(),
             gated: BTreeMap::new(),
+            storing_starts: BTreeMap::new(),
             early_deliveries: BTreeMap::new(),
             pending_forwards: BTreeMap::new(),
             pending_failures: BTreeMap::new(),
@@ -1409,6 +1421,11 @@ impl Driver {
                 }
                 Err(error) => self.stop_for_store(error.to_string()),
             },
+            Signal::StartStored {
+                firing,
+                attempt,
+                result,
+            } => self.on_start_stored(firing, attempt, result),
             Signal::HookAdmitted {
                 decision_id,
                 decision,
@@ -2110,9 +2127,26 @@ impl Driver {
             // ahead of anything the runner sends back: an instant runner's
             // `Finished` riding the signal channel can otherwise land first, and
             // the late `StepStarted` then reports the finalized firing as unknown.
+            // The External record `apply_event` appends takes the next seq.
+            let seq = self.engine.log.len() as u64;
             let commands = self.apply_event(Event::StepStarted { firing, attempt });
             debug_assert!(commands.is_empty(), "StepStarted derives no commands");
+            if let Some(run_log) = self.run_log.clone() {
+                // The step starts only once the run log holds the
+                // acknowledgement, so a stored log without it proves the step
+                // never ran: a crash or a failed write here leaves no runner
+                // behind it, as the run log gates a scope's first attempt.
+                self.await_start_stored(run_log, resolved, seq);
+                return;
+            }
         }
+        self.start_admitted(resolved);
+    }
+
+    /// Start an acknowledged attempt: fail it now for a delivery that could
+    /// not be resolved, or spawn its runner and hand it what arrived early.
+    fn start_admitted(&mut self, resolved: &ResolvedFiring) {
+        let firing = resolved.id();
         if let Some((attempt, message)) = self.pending_failures.remove(&firing) {
             self.reject_pending_forwards(firing);
             self.fail_now(firing, attempt, &message, steps::SECRET_UNAVAILABLE_CLASS);
@@ -2121,6 +2155,55 @@ impl Driver {
         self.start(resolved);
         self.flush_early_deliveries(firing);
         self.flush_pending_forwards(firing);
+    }
+
+    /// Answer [`Signal::StartStored`] once the run log holds the record at
+    /// `seq`. The wait runs off the driver task, as a scope record's does; the
+    /// attempt is parked until it answers.
+    fn await_start_stored(
+        &mut self,
+        run_log: Arc<dyn EventObserver>,
+        resolved: &ResolvedFiring,
+        seq: u64,
+    ) {
+        let (firing, attempt) = (resolved.id(), resolved.attempt());
+        let tx = self.tx.clone();
+        let wait = self.background.spawn(async move {
+            let result = run_log.durable(seq).await;
+            let _ = tx
+                .send(Signal::StartStored {
+                    firing,
+                    attempt,
+                    result,
+                })
+                .await;
+        });
+        self.storing_starts.insert(firing, GatedStart {
+            resolved: resolved.clone(),
+            wait,
+        });
+    }
+
+    /// The parked attempt's `StepStarted` is durable: start it. A store that
+    /// failed to hold it stops the run before the step runs, as a failed
+    /// scope record does.
+    fn on_start_stored(
+        &mut self,
+        firing: FiringId,
+        attempt: Attempt,
+        result: Result<(), ObserveError>,
+    ) {
+        let Some(parked) = self.storing_starts.remove(&firing) else {
+            return;
+        };
+        if let Err(error) = result {
+            self.reject_pending_forwards(firing);
+            self.stop_for_store(error.to_string());
+            return;
+        }
+        if parked.resolved.attempt() == attempt {
+            self.start_admitted(&parked.resolved);
+        }
     }
 
     /// The execution has its slot: start the attempt that waited for it and
@@ -2170,6 +2253,41 @@ impl Driver {
                 "cancel"
             },
             "step cancelled while waiting for an attempt slot"
+        );
+        let outcome = Outcome::new(Status::Cancelled, Value::Null);
+        let tx = self.tx.clone();
+        self.background.spawn(async move {
+            let _ = tx
+                .send(Signal::Finished {
+                    firing,
+                    attempt,
+                    outcome,
+                })
+                .await;
+        });
+        true
+    }
+
+    /// Settle an attempt that a stop reached while its `StepStarted` waited to
+    /// be durable: the wait is abandoned and the attempt finishes `Cancelled`
+    /// before its runner ever started.
+    fn finish_storing_start(&mut self, firing: FiringId, ctl: &Control) -> bool {
+        let Some(parked) = self.storing_starts.remove(&firing) else {
+            return false;
+        };
+        parked.wait.abort();
+        self.reject_pending_forwards(firing);
+        self.pending_failures.remove(&firing);
+        let attempt = parked.resolved.attempt();
+        tracing::debug!(
+            firing = firing.raw(),
+            attempt = attempt.raw(),
+            control = if matches!(ctl, Control::Kill) {
+                "kill"
+            } else {
+                "cancel"
+            },
+            "step cancelled while its start record was being stored"
         );
         let outcome = Outcome::new(Status::Cancelled, Value::Null);
         let tx = self.tx.clone();
@@ -3072,7 +3190,7 @@ impl Driver {
     /// send lands: the deadline is what guarantees progress.
     fn stop_step(&mut self, firing: FiringId, ctl: Control, reason: CancelReason) {
         let Some(task) = self.tasks.get_mut(&firing) else {
-            if !self.finish_gated_start(firing, &ctl) {
+            if !self.finish_gated_start(firing, &ctl) && !self.finish_storing_start(firing, &ctl) {
                 self.finish_pending_start(firing, &ctl);
             }
             return;
@@ -3220,10 +3338,12 @@ impl Driver {
     }
 
     fn is_pending_start(&self, firing: FiringId) -> bool {
-        self.pending_starts
-            .values()
-            .flatten()
-            .any(|resolved| resolved.id() == firing)
+        self.storing_starts.contains_key(&firing)
+            || self
+                .pending_starts
+                .values()
+                .flatten()
+                .any(|resolved| resolved.id() == firing)
     }
 
     fn flush_pending_forwards(&mut self, firing: FiringId) {

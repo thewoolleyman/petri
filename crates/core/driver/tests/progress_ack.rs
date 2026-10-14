@@ -632,3 +632,176 @@ async fn a_scope_released_while_storing_runs_its_point_once_stored() {
     assert_eq!(report.status, RunStatus::Cancelled);
     assert_eq!(hooks.0.load(Ordering::SeqCst), 1, "the point ran once");
 }
+
+// ── The run log gates an attempt's start ───────────────────────────────────
+
+/// A run log that stores every record at once except an attempt's
+/// `StepStarted`: that one it holds until released or, told to fail, refuses.
+struct StartGate {
+    fail:      bool,
+    released:  watch::Sender<bool>,
+    start_seq: watch::Sender<Option<u64>>,
+}
+
+impl StartGate {
+    fn holding() -> Arc<Self> {
+        Arc::new(Self::new(false))
+    }
+
+    fn failing() -> Arc<Self> {
+        Arc::new(Self::new(true))
+    }
+
+    fn new(fail: bool) -> Self {
+        Self {
+            fail,
+            released: watch::channel(false).0,
+            start_seq: watch::channel(None).0,
+        }
+    }
+
+    fn release(&self) {
+        self.released.send_replace(true);
+    }
+
+    /// Wait until the driver has handed the run log an attempt's start.
+    async fn wait_start(&self) {
+        let mut start = self.start_seq.subscribe();
+        timeout(Duration::from_secs(10), start.wait_for(Option::is_some))
+            .await
+            .expect("the driver appends the start within the deadline")
+            .expect("the run log outlives the wait");
+    }
+}
+
+#[async_trait::async_trait]
+impl EventObserver for StartGate {
+    fn on_record(&self, record: &EventRecord, _recorded_at: u64, _state: &EngineState) {
+        if matches!(record.event, Event::StepStarted { .. }) {
+            self.start_seq.send_if_modified(|start| {
+                if start.is_none() {
+                    *start = Some(record.seq);
+                    return true;
+                }
+                false
+            });
+        }
+    }
+
+    async fn durable(&self, seq: u64) -> Result<(), ObserveError> {
+        let start = *self.start_seq.borrow();
+        if start.is_none_or(|start| seq < start) {
+            return Ok(());
+        }
+        if self.fail {
+            return Err(ObserveError::new("start-gate", "the start write failed"));
+        }
+        let mut released = self.released.subscribe();
+        released
+            .wait_for(|released| *released)
+            .await
+            .map_err(|_| ObserveError::new("start-gate", "the run log went away"))?;
+        Ok(())
+    }
+}
+
+const MARKING: ir::StepKindId = ir::StepKindId::new_static("marking");
+
+/// Notes that it ran, and succeeds.
+#[derive(Default)]
+struct MarkingStep {
+    ran: AtomicBool,
+}
+
+impl MarkingStep {
+    fn ran(&self) -> bool {
+        self.ran.load(Ordering::SeqCst)
+    }
+}
+
+impl ir::StepKind for MarkingStep {
+    fn id(&self) -> ir::StepKindId {
+        MARKING
+    }
+
+    #[expect(
+        clippy::unnecessary_literal_bound,
+        reason = "the `StepKind` trait fixes this signature; an impl cannot widen the lifetime"
+    )]
+    fn name(&self) -> &str {
+        "marking"
+    }
+}
+
+#[async_trait::async_trait]
+impl steps::StepRunner for MarkingStep {
+    async fn run(&self, _ctx: steps::StepCtx) -> Outcome {
+        self.ran.store(true, Ordering::SeqCst);
+        Outcome::success(json!("ran"))
+    }
+}
+
+/// An attempt runs only once the run log holds its `StepStarted`, so a run
+/// log without that record proves the attempt never ran.
+#[tokio::test]
+async fn a_step_starts_only_once_the_run_log_holds_its_start() {
+    let dir = RunDir::new("start-stored");
+    let run_log = StartGate::holding();
+    let step = Arc::new(MarkingStep::default());
+    let driver = host_driver_full(
+        one_node(MARKING),
+        &dir,
+        MapSecrets::empty(),
+        RunConfig::new(dir.path()),
+        registry_with(step.clone()),
+    )
+    .observe_run_log(run_log.clone() as Arc<dyn EventObserver>);
+    let run = tokio::spawn(driver.run());
+
+    run_log.wait_start().await;
+    sleep(Duration::from_millis(50)).await;
+    assert!(
+        !step.ran(),
+        "the step did not run before the run log held its start"
+    );
+
+    run_log.release();
+    let report = timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the run ends once the run log holds the start")
+        .expect("the run task finished");
+    assert_eq!(report.status, RunStatus::Success);
+    assert!(step.ran());
+    assert_eq!(report.store_failure, None);
+}
+
+/// A run log that cannot store an attempt's `StepStarted` stops the run
+/// before the step runs: nothing runs that a resume could not find.
+#[tokio::test]
+async fn a_run_log_that_cannot_store_a_start_stops_the_run_before_the_step() {
+    let dir = RunDir::new("start-unstored");
+    let run_log = StartGate::failing();
+    let step = Arc::new(MarkingStep::default());
+    let report = host_driver_full(
+        one_node(MARKING),
+        &dir,
+        MapSecrets::empty(),
+        RunConfig::new(dir.path()),
+        registry_with(step.clone()),
+    )
+    .observe_run_log(run_log.clone() as Arc<dyn EventObserver>)
+    .await_run()
+    .await;
+
+    let failure = report.store_failure.expect("the run stopped for its store");
+    assert!(failure.contains("the start write failed"), "{failure}");
+    assert!(!step.ran(), "the step never ran");
+    assert!(
+        !report
+            .state
+            .log
+            .events()
+            .any(|event| matches!(event, Event::StepFinished { .. })),
+        "no attempt finished after the store failed"
+    );
+}
