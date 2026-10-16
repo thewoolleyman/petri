@@ -152,6 +152,10 @@ pub struct PluginSettings {
     dev:          bool,
     host_address: Option<String>,
     env:          BTreeMap<String, String>,
+    /// Extra command-line arguments the plugin is launched with.
+    args:         Vec<String>,
+    /// Names of host environment variables passed through to the plugin.
+    inherit_env:  Vec<String>,
     /// A non-secret description of the backend the plugin will drive, from
     /// the same environment it inherits: the effective daemon endpoint,
     /// account, and target. Recorded on every lease and checked before a
@@ -169,6 +173,8 @@ impl fmt::Debug for PluginSettings {
             .field("dev", &self.dev)
             .field("host_address", &self.host_address)
             .field("env_keys", &self.env.keys())
+            .field("args", &self.args)
+            .field("inherit_env", &self.inherit_env)
             .field("fingerprint", &self.fingerprint)
             .finish()
     }
@@ -214,6 +220,8 @@ impl PluginSettings {
             dev,
             host_address,
             env,
+            args: Vec::new(),
+            inherit_env: Vec::new(),
             fingerprint,
         })
     }
@@ -238,6 +246,15 @@ impl PluginSettings {
         settings.env.extend(env);
         settings.fingerprint = fingerprint_for(kind, &settings.env);
         Ok(settings)
+    }
+
+    /// These settings, launching the plugin with `args` and passing the
+    /// named host variables through, as the embedder configured them.
+    #[must_use]
+    pub fn with_launch(mut self, args: Vec<String>, inherit_env: Vec<String>) -> Self {
+        self.args = args;
+        self.inherit_env = inherit_env;
+        self
     }
 
     /// Settings for a plugin at an explicit path, trusted as given: tests
@@ -317,6 +334,8 @@ impl PluginSettings {
             config.dev = true;
         }
         config.env.clone_from(&self.env);
+        config.args.clone_from(&self.args);
+        config.inherit_env.clone_from(&self.inherit_env);
         Ok(config)
     }
 }
@@ -654,6 +673,23 @@ mod tests {
                 .effective_fingerprint(&ProviderHealth::new(HealthStatus::Ok))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn configured_launch_arguments_and_inherited_variables_reach_the_plugin() {
+        let settings = PluginSettings::configured(
+            "kubernetes",
+            Some(PathBuf::from("/usr/local/bin/sandbox-driver-kubernetes")),
+            None,
+            true,
+            None,
+            BTreeMap::new(),
+        )
+        .expect("settings")
+        .with_launch(vec!["--verbose".to_owned()], vec!["KUBECONFIG".to_owned()]);
+        let config = settings.config().expect("dev configuration");
+        assert_eq!(config.args, vec!["--verbose".to_owned()]);
+        assert_eq!(config.inherit_env, vec!["KUBECONFIG".to_owned()]);
     }
 
     #[test]
