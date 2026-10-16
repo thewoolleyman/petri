@@ -218,6 +218,28 @@ impl PluginSettings {
         })
     }
 
+    /// Settings an embedder configured for a third-party `kind`: the
+    /// executable at `path` (resolved as usual when `None`), verified against
+    /// `sha256` unless `dev`, with `env` forwarded on top of the standard
+    /// variables. The process environment supplies only those standard
+    /// variables.
+    pub fn configured(
+        kind: &str,
+        path: Option<PathBuf>,
+        sha256: Option<String>,
+        dev: bool,
+        host_address: Option<String>,
+        env: BTreeMap<String, String>,
+    ) -> Result<Self, PluginError> {
+        let mut settings = Self::from_env(kind, Some(dev))?;
+        settings.path = path;
+        settings.sha256 = sha256.filter(|value| !value.trim().is_empty());
+        settings.host_address = host_address.filter(|value| !value.trim().is_empty());
+        settings.env.extend(env);
+        settings.fingerprint = fingerprint_for(kind, &settings.env);
+        Ok(settings)
+    }
+
     /// Settings for a plugin at an explicit path, trusted as given: tests
     /// and hosts that ship their own plugin.
     pub fn at_path(kind: &str, path: impl Into<PathBuf>) -> Result<Self, PluginError> {
