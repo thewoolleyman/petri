@@ -265,13 +265,18 @@ impl RoutingExecutor {
         }
     }
 
-    fn plugin_kind(&self) -> &'static str {
+    fn plugin_kind(&self) -> &str {
         if self.simulated {
             return SIMULATED_KIND;
         }
         match self.options.backend {
             SandboxBackend::Host | SandboxBackend::Docker => "docker",
             SandboxBackend::Daytona => "daytona",
+            SandboxBackend::Plugin => self
+                .options
+                .plugin
+                .as_ref()
+                .map_or("plugin", |settings| settings.kind().as_str()),
         }
     }
 
@@ -288,7 +293,13 @@ impl RoutingExecutor {
                     supports_host_workspace: !self.simulated,
                 }),
                 ContainerSource::Env => {
-                    if let Some(providers) = &self.in_process {
+                    // A plugin backend names a third-party provider, which is
+                    // always a plugin even when built-in providers are linked.
+                    let in_process = self
+                        .in_process
+                        .as_ref()
+                        .filter(|_| self.options.backend != SandboxBackend::Plugin);
+                    if let Some(providers) = in_process {
                         let (source, network) =
                             self.in_process_source(providers, self.plugin_kind(), None)?;
                         return Ok(ProviderConfig {
@@ -297,9 +308,14 @@ impl RoutingExecutor {
                             supports_host_workspace: network.supports_host_workspace(),
                         });
                     }
-                    let settings =
-                        PluginSettings::from_env(self.plugin_kind(), self.options.plugin_dev)
-                            .map_err(|error| error.to_string())?;
+                    let settings = match (&self.options.plugin, self.options.backend) {
+                        (Some(settings), SandboxBackend::Plugin) => settings.clone(),
+                        (None, SandboxBackend::Plugin) => {
+                            return Err("the plugin backend needs plugin settings".to_owned());
+                        }
+                        _ => PluginSettings::from_env(self.plugin_kind(), self.options.plugin_dev)
+                            .map_err(|error| error.to_string())?,
+                    };
                     let host_address = settings.host_address().map_err(|error| error.to_string());
                     let supports_host_workspace = settings.supports_host_workspace();
                     Ok(ProviderConfig {
