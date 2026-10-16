@@ -364,7 +364,15 @@ impl SandboxExecutor {
             return Ok(spec);
         }
         if self.options.backend != SandboxBackend::Daytona {
-            if self.options.backend == SandboxBackend::Docker
+            let plugin = self.options.backend == SandboxBackend::Plugin;
+            if plugin && !scope.services.is_empty() {
+                return Err(EnvError::backend(
+                    "plugin",
+                    "acquire",
+                    "services are realized as Docker sidecars; select the docker backend",
+                ));
+            }
+            let mut spec = if self.options.backend != SandboxBackend::Host
                 && matches!(scope.runtime.target, RuntimeTarget::HostProcess)
             {
                 let mut runner = scope.clone();
@@ -373,9 +381,19 @@ impl SandboxExecutor {
                     options:     ContainerOptions::default(),
                     credentials: None,
                 };
-                return build_spec(&runner, labels, name, ctx);
+                build_spec(&runner, labels, name, ctx)?
+            } else {
+                build_spec(scope, labels, name, ctx)?
+            };
+            if plugin {
+                // The Docker provider's settings mean nothing to another
+                // provider; a plugin reads only the generic spec.
+                spec.provider_config = serde_json::Value::Null;
             }
-            return build_spec(scope, labels, name, ctx);
+            if let Some(resources) = &self.options.resources {
+                spec.resources = *resources;
+            }
+            return Ok(spec);
         }
         let image = self.options.runner_image(&scope.runtime)?;
         let snapshot = RunnerSnapshot::new(

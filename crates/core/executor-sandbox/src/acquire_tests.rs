@@ -376,3 +376,35 @@ async fn a_reused_sandbox_cannot_bypass_the_block_policy() {
         .await;
     fixture.assert_deleted().await;
 }
+
+#[tokio::test]
+async fn a_plugin_backend_sends_resources_and_no_docker_settings() {
+    let mut resources = sandbox_driver::Resources::default();
+    resources.cpu_cores = Some(2);
+    resources.memory_mb = Some(4096);
+    for (backend, docker_settings) in [
+        (crate::SandboxBackend::Docker, true),
+        (crate::SandboxBackend::Plugin, false),
+    ] {
+        let mut fixture = Fixture::new(EnvironmentBehavior::Fail);
+        {
+            let options = &mut Arc::get_mut(&mut fixture.executor).unwrap().options;
+            options.backend = backend;
+            options.resources = Some(resources);
+        }
+        fixture.provider.allow_create.notify_one();
+        fixture
+            .acquire()
+            .await
+            .unwrap()
+            .expect_err("acquisition stops at the scripted boundary");
+        let request = fixture.provider.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.resources, resources, "{backend}");
+        assert_eq!(
+            !request.provider_config.is_null(),
+            docker_settings,
+            "{backend}"
+        );
+        fixture.assert_deleted().await;
+    }
+}
