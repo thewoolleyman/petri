@@ -911,16 +911,22 @@ impl Reader<'_> {
             .and_then(toml::Value::as_str)
             .unwrap_or("")
             .to_string();
-        if !matches!(provider.as_str(), "local" | "docker" | "daytona") {
+        let bundled = matches!(provider.as_str(), "local" | "docker" | "daytona");
+        // Any other well-formed kind names a third-party sandbox-driver
+        // plugin the embedder configures; it takes an image and resources as
+        // the container providers do.
+        let plugin = !bundled && is_plugin_kind(&provider);
+        if !bundled && !plugin {
             let source = at(&format!("{base_table}.provider"));
             self.unsupported_in(
                 &source,
                 "workflow_toml.environments.provider",
                 format!(
                     "`[environments.{id}] provider = \"{provider}\"` in `{source}` is not \
-                     `local`, `docker` or `daytona`"
+                     `local`, `docker`, `daytona` or a plugin kind"
                 ),
-                "set the provider to `local`, `docker` or `daytona`",
+                "set the provider to `local`, `docker`, `daytona`, or a plugin kind: a \
+                 lower-case name of letters, digits and hyphens",
             );
             return;
         }
@@ -965,7 +971,7 @@ impl Reader<'_> {
         if let Some((resources, table)) = field("resources")
             && let Some(resources) = resources.as_table()
         {
-            if provider == "daytona" {
+            if provider == "daytona" || plugin {
                 environment.cpu_cores = resources
                     .get("cpu")
                     .and_then(toml::Value::as_integer)
@@ -1331,4 +1337,12 @@ mod tests {
         assert_eq!(size_mb(&toml::Value::Integer(2)), Some(2048));
         assert_eq!(size_mb(&toml::Value::String("1.5GB".into())), None);
     }
+}
+
+/// A provider kind naming a third-party sandbox-driver plugin: a lower-case
+/// ASCII letter followed by lower-case letters, digits and hyphens.
+fn is_plugin_kind(kind: &str) -> bool {
+    let mut chars = kind.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
