@@ -141,8 +141,14 @@ fn workflow_toml_sections_warn_or_reject_and_never_pass_silently() {
         "an environment id with no table is refused, as Fabro refuses it"
     );
     assert_eq!(
-        codes("[run.environment]\nid = \"e\"\n[environments.e]\nprovider = \"k8s\"\n"),
-        ["unsupported.workflow_toml.environments.provider"]
+        codes("[run.environment]\nid = \"e\"\n[environments.e]\nprovider = \"K8s!\"\n"),
+        ["unsupported.workflow_toml.environments.provider"],
+        "a provider that is neither bundled nor a well-formed plugin kind is refused"
+    );
+    assert!(
+        codes("[run.environment]\nid = \"e\"\n[environments.e]\nprovider = \"kubernetes\"\n")
+            .is_empty(),
+        "a well-formed plugin kind is accepted for the embedder to configure"
     );
     assert_eq!(
         codes("[run.prepare]\nsteps = [{ script = \"a\", command = [\"b\"] }]\n"),

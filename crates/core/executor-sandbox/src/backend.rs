@@ -9,6 +9,8 @@ use executor::EnvError;
 use ir::RuntimeSpec;
 use sandbox_driver::{NetworkPolicy, Resources, SandboxKind};
 
+use crate::plugin::PluginSettings;
+
 const RUNNER_PIN: &str = "f8bbbfd81934";
 const DEFAULT_LABEL: &str = "ubuntu-24.04";
 
@@ -21,6 +23,10 @@ pub enum SandboxBackend {
     Docker,
     /// A Daytona sandbox, with a nested job container when requested.
     Daytona,
+    /// A third-party sandbox-driver plugin, launched from
+    /// [`SandboxOptions::plugin`]: runner images for process targets and job
+    /// images for containers, as with Docker.
+    Plugin,
 }
 
 impl fmt::Display for SandboxBackend {
@@ -29,6 +35,7 @@ impl fmt::Display for SandboxBackend {
             Self::Host => "host",
             Self::Docker => "docker",
             Self::Daytona => "daytona",
+            Self::Plugin => "plugin",
         })
     }
 }
@@ -41,8 +48,9 @@ impl FromStr for SandboxBackend {
             "host" => Ok(Self::Host),
             "docker" => Ok(Self::Docker),
             "daytona" => Ok(Self::Daytona),
+            "plugin" => Ok(Self::Plugin),
             _ => Err(format!(
-                "unknown backend {value:?}; expected host, docker, or daytona"
+                "unknown backend {value:?}; expected host, docker, daytona, or plugin"
             )),
         }
     }
@@ -81,6 +89,12 @@ pub struct SandboxOptions {
     pub daytona_kind:      DaytonaSandboxKind,
     /// `None` leaves development mode to the environment and build profile.
     pub plugin_dev:        Option<bool>,
+    /// The plugin the [`SandboxBackend::Plugin`] backend launches, as the
+    /// embedder configured it. Required by that backend, ignored otherwise.
+    pub plugin:            Option<PluginSettings>,
+    /// Resources for every container sandbox on the Docker and Plugin
+    /// backends. Daytona sizes its sandboxes from `daytona_resources`.
+    pub resources:         Option<Resources>,
 }
 
 /// The Daytona offering that hosts a workflow runner.

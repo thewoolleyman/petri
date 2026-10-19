@@ -51,6 +51,9 @@ pub(crate) enum ProviderTransport {
     /// The kind's plugin, configured from this process's environment on
     /// first use.
     EnvPlugin,
+    /// A third-party plugin the embedder configured
+    /// ([`SandboxOptions::plugin`]).
+    Configured(PluginSettings),
 }
 
 /// The provider kinds a router can reach, and how. A kind with no entry
@@ -322,6 +325,11 @@ impl RoutingExecutor {
             None => match self.options.backend {
                 SandboxBackend::Host | SandboxBackend::Docker => CONTAINER_KIND,
                 SandboxBackend::Daytona => "daytona",
+                SandboxBackend::Plugin => self
+                    .options
+                    .plugin
+                    .as_ref()
+                    .map_or("plugin", |settings| settings.kind().as_str()),
             },
         }
     }
@@ -403,7 +411,24 @@ impl RoutingExecutor {
                  as recorded"
             ));
         }
-        let transport = self.providers.get(kind)?;
+        // A configured plugin serves its own kind, whether or not built-in
+        // providers are linked: a third-party kind is always a plugin.
+        let configured = self
+            .options
+            .plugin
+            .as_ref()
+            .filter(|settings| kind != HOST_KIND && settings.kind().as_str() == kind)
+            .map(|settings| ProviderTransport::Configured(settings.clone()));
+        let transport = match configured {
+            Some(transport) => transport,
+            None if self.options.backend == SandboxBackend::Plugin
+                && kind != HOST_KIND
+                && self.options.plugin.is_none() =>
+            {
+                return Err("the plugin backend needs plugin settings".to_owned());
+            }
+            None => self.providers.get(kind)?.clone(),
+        };
         let host_registry = if kind == HOST_KIND {
             let directory = self.identity.run_dir().join("host-registry");
             fs::create_dir_all(&directory)
@@ -418,6 +443,13 @@ impl RoutingExecutor {
             None
         };
         let (source, network): (Arc<dyn ProviderSource>, ProviderNetwork) = match transport {
+            ProviderTransport::Configured(settings) => {
+                let network = ProviderNetwork::from_parts(
+                    settings.host_address().map_err(|error| error.to_string()),
+                    settings.supports_host_workspace(),
+                );
+                (Arc::new(PluginSource::new(settings)), network)
+            }
             ProviderTransport::Linked(factory) => {
                 let network = factory.network();
                 let context = ProviderContext::new(
