@@ -51,16 +51,18 @@ pub fn daytona(
 /// Why a provider's health report cannot confirm its namespace.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "the {kind} provider reports no verified resource identity; its effective \
-     organization must be known before sandbox resources can be created or recovered"
+    "the {kind} provider reports no verified resource identity; its resource namespace \
+     must be known before sandbox resources can be created or recovered"
 )]
 pub struct MissingIdentity {
     kind: String,
 }
 
 /// The fingerprint a provider serves under: `seed`, plus `:<identity>` when
-/// its health report names one. Daytona must name one, because its seed
-/// alone cannot tell two organizations behind the same key apart.
+/// its health report names one. Host and Docker need none: their seeds
+/// name the registry directory and the daemon endpoint. Every other kind
+/// must name one, because its seed alone cannot tell two organizations
+/// behind the same key, or two hosts behind the same plugin, apart.
 pub fn verified(
     kind: &str,
     seed: &str,
@@ -70,7 +72,7 @@ pub fn verified(
         .identity
         .as_deref()
         .filter(|identity| !identity.trim().is_empty());
-    if kind == "daytona" && identity.is_none() {
+    if identity.is_none() && !matches!(kind, "host" | "docker") {
         return Err(MissingIdentity {
             kind: kind.to_owned(),
         });

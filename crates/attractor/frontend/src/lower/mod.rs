@@ -521,8 +521,10 @@ impl Ctx<'_> {
                 );
             }
         }
+        // An image makes a container target under the providers that run
+        // one; a registered provider is provisioned from its own template.
         if let Some(image) = &environment.image
-            && environment.provider != "local"
+            && matches!(environment.provider.as_str(), "docker" | "daytona")
         {
             scope.runtime.target = ir::RuntimeTarget::Container {
                 image:       SmolStr::new(image),

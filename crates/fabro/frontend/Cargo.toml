@@ -15,6 +15,7 @@ workspace = true
 name = "frontend_fabro"
 
 [dependencies]
+sandbox-driver = { workspace = true }
 ir = { workspace = true }
 frontend = { workspace = true }
 frontend-attractor = { workspace = true }

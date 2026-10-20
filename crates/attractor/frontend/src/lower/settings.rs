@@ -118,7 +118,8 @@ impl EnvValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Environment {
     pub id:        String,
-    /// `local`, `docker` or `daytona`, as written.
+    /// `local`, `docker`, `daytona`, or a registered provider kind, as
+    /// written and already validated.
     pub provider:  String,
     /// `image.docker`, when set.
     pub image:     Option<String>,
@@ -130,12 +131,12 @@ pub struct Environment {
 }
 
 impl Environment {
-    /// The sandbox backend this provider maps to, in the host's spelling.
-    pub fn sandbox_backend(&self) -> &'static str {
+    /// The sandbox backend this provider maps to, in the host's spelling:
+    /// `local` is the host; every other name is carried as written.
+    pub fn sandbox_backend(&self) -> &str {
         match self.provider.as_str() {
-            "docker" => "docker",
-            "daytona" => "daytona",
-            _ => "host",
+            "local" => "host",
+            kind => kind,
         }
     }
 }

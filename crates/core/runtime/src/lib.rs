@@ -50,7 +50,8 @@ mod runtime;
 
 pub use executor_sandbox::{
     DaytonaResources, DaytonaSandboxKind, InProcessProviders, LostSandbox, ProviderContext,
-    ProviderFactory, ProviderNetwork, SandboxBackend, SandboxOptions, fingerprint,
+    ProviderFactory, ProviderNetwork, ProviderRegistrations, RegistrationError, SandboxBackend,
+    SandboxOptions, fingerprint,
 };
 pub use runtime::{
     AdmissionPass, AdmissionProblem, LoadError, RunAccess, RunOptions, RunRuntime, RunServiceGuard,

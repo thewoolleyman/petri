@@ -20,7 +20,9 @@ use engine::{EngineStart, EventLog, ReplayMismatch};
 use executor::{
     DEFAULT_GRACE, Executor, MapSecrets, Masker, ProgressSink, Retention, SecretProvider,
 };
-use executor_sandbox::{InProcessProviders, LeaseLedger, RoutingExecutor, SandboxOptions};
+use executor_sandbox::{
+    InProcessProviders, LeaseLedger, ProviderRegistrations, RoutingExecutor, SandboxOptions,
+};
 use frontend::{CompileInputs, DirFiles, FileSource, Frontend, Lowered, REPOSITORY_VAR, Span};
 use ir::{ExecutionId, Graph, InvocationId};
 use serde_json::Value;
@@ -168,8 +170,9 @@ pub struct Runtime {
     /// The standard router acquires every scope on the simulated provider:
     /// a dry run.
     simulated:       bool,
-    /// Built-in providers the standard router reaches instead of plugins.
-    in_process:      Option<InProcessProviders>,
+    /// The providers the standard router reaches, when the host chose them;
+    /// standalone Petri's first-party plugins otherwise.
+    providers:       Option<ProviderRegistrations>,
     sources:         Sources,
 }
 
@@ -249,7 +252,7 @@ impl Runtime {
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
             simulated:       false,
-            in_process:      None,
+            providers:       None,
             sources:         Sources::default(),
         }
     }
@@ -274,7 +277,7 @@ impl Runtime {
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
             simulated:       false,
-            in_process:      None,
+            providers:       None,
             sources:         Sources::default(),
         }
     }
@@ -372,8 +375,18 @@ impl Runtime {
     /// run ([`Runtime::simulated_sandboxes`]) still touches no provider,
     /// and [`Runtime::executor`] still replaces the router outright.
     #[must_use]
-    pub fn in_process_providers(mut self, providers: InProcessProviders) -> Self {
-        self.in_process = Some(providers);
+    pub fn in_process_providers(self, providers: InProcessProviders) -> Self {
+        self.sandbox_providers(ProviderRegistrations::linked(providers))
+    }
+
+    /// Reach exactly the providers `providers` registers: linked built-ins,
+    /// first-party plugins, and plugins registered for custom kinds. Every
+    /// standard router this runtime builds uses them, as with
+    /// [`Runtime::in_process_providers`]; a kind with no entry fails
+    /// routably at acquire, and no plugin is launched in its place.
+    #[must_use]
+    pub fn sandbox_providers(mut self, providers: ProviderRegistrations) -> Self {
+        self.providers = Some(providers);
         self
     }
 
@@ -972,8 +985,8 @@ impl Runtime {
                 self.options.retention,
                 self.options.sandbox.clone(),
             );
-            match &self.in_process {
-                Some(providers) => router.with_in_process(providers.clone()),
+            match &self.providers {
+                Some(providers) => router.with_providers(providers.clone()),
                 None => router,
             }
         };
