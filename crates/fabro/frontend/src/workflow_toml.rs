@@ -27,7 +27,8 @@
 //!   `daytona` the Daytona plugin) when `--backend` is not given;
 //!   `image.docker` is the scope's container image under those two; `env` is
 //!   the scope environment, with `{{ secrets.NAME }}` as a `$secret` reference
-//!   resolved at spawn; `resources` are the Daytona runner size. The other keys
+//!   resolved at spawn; `resources` are the Daytona runner size, or a
+//!   registered provider's sandbox size over its template. The other keys
 //!   Fabro's environment table accepts (`cwd`, `network`, `lifecycle`,
 //!   `labels`, `image.dockerfile`) are the Fabro platform's: known, read by
 //!   nothing here, and accepted silently in every layer, as `[workflow] engine`
@@ -980,10 +981,11 @@ impl Reader<'_> {
                 .or_else(|| base.get(key).map(|value| (value, base_table.as_str())))
         };
         // A registered provider is provisioned from its registration's
-        // template; the keys that size or image a built-in provider's
-        // sandbox would be ignored, so they are refused instead.
+        // template, so an image would be ignored and is refused instead.
+        // `resources` size the run's sandbox over the template's and are
+        // lowered below, as Daytona's are.
         if !built_in {
-            for key in ["image", "resources"] {
+            for key in ["image"] {
                 if let Some((_, table)) = field(key) {
                     self.unsupported_in(
                         &at(&format!("{table}.{key}")),
@@ -1031,7 +1033,7 @@ impl Reader<'_> {
         if let Some((resources, table)) = field("resources")
             && let Some(resources) = resources.as_table()
         {
-            if provider == "daytona" {
+            if provider == "daytona" || !built_in {
                 environment.cpu_cores = resources
                     .get("cpu")
                     .and_then(toml::Value::as_integer)

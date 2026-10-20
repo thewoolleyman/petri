@@ -43,8 +43,9 @@ A sandbox provider selection is a validated provider kind, not a closed set:
 valid kind a provider the host registers. A frontend carries the name through
 as written and never maps an unknown one to the host; the runtime decides
 whether it is registered. A registered provider runs ordinary process scopes
-from its registration's template, so a frontend refuses the image and resource
-settings that would size a built-in provider's sandbox under it.
+from its registration's template, so a frontend refuses an image under it.
+Resources are the run's to choose and lower as they do for Daytona; the
+runtime lays them over the template's field by field.
 
 Every frontend emits diagnostics through one shared type:
 

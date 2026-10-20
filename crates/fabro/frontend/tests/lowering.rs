@@ -1700,7 +1700,7 @@ fn run_agent_permissions_layer_like_the_model_settings() {
 }
 
 #[test]
-fn a_registered_provider_name_survives_lowering_and_refuses_image_and_resources() {
+fn a_registered_provider_name_survives_lowering_refuses_an_image_and_lowers_resources() {
     let settings =
         "[run.environment]\nid = 'custom'\n[environments.custom]\nprovider = 'fixture-provider'\n";
     let text = dot("start -> exit");
@@ -1723,20 +1723,31 @@ fn a_registered_provider_name_survives_lowering_and_refuses_image_and_resources(
         graph.scopes[0].runtime.target,
         ir::RuntimeTarget::HostProcess
     ));
-    for field in ["image = { docker = 'alpine' }", "resources = { cpu = 2 }"] {
-        let settings = format!("{settings}{field}\n");
-        let input = files(&[("wf/workflow.toml", &settings)]);
-        let lowered = load("wf/workflow.fabro", &text, &input, &CompileInputs::new());
-        let codes: Vec<String> = lowered
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code.to_string())
-            .collect();
-        assert_eq!(
-            codes,
-            ["unsupported.workflow_toml.environments.custom"],
-            "{field}"
-        );
-        assert!(lowered.graph.is_none(), "silently accepted {field}");
-    }
+    let image = format!("{settings}image = {{ docker = 'alpine' }}\n");
+    let input = files(&[("wf/workflow.toml", &image)]);
+    let lowered = load("wf/workflow.fabro", &text, &input, &CompileInputs::new());
+    let codes: Vec<String> = lowered
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.to_string())
+        .collect();
+    assert_eq!(codes, ["unsupported.workflow_toml.environments.custom"]);
+    assert!(lowered.graph.is_none(), "silently accepted an image");
+    // Resources size the run's sandbox over the registration's template, so
+    // they lower exactly as Daytona's do.
+    let sized = format!("{settings}resources = {{ cpu = 2, memory = '4GB', disk = '20GB' }}\n");
+    let input = files(&[("wf/workflow.toml", &sized)]);
+    let lowered = load("wf/workflow.fabro", &text, &input, &CompileInputs::new());
+    assert!(
+        lowered.diagnostics.iter().next().is_none(),
+        "{:?}",
+        lowered.diagnostics
+    );
+    let graph = lowered
+        .graph
+        .expect("resources lower under a registered kind");
+    let launch = &graph.params["fabro.launch"];
+    assert_eq!(launch["cpu_cores"], json!(2));
+    assert_eq!(launch["memory_mb"], json!(4096));
+    assert_eq!(launch["disk_mb"], json!(20480));
 }

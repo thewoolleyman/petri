@@ -48,9 +48,11 @@ or prune is given the file again.
 
 A Fabro `workflow.toml` selects the provider by name:
 `[environments.<id>] provider = "lima"`. The name is carried through lowering
-as written. `image` and `resources` are refused under a registered provider,
-since its sandbox comes from the registration; environment variables apply
-as they do everywhere.
+as written. `image` is refused under a registered provider, since its
+sandbox comes from the registration. `resources` size the run's sandbox: an
+embedder passes them as `SandboxOptions::resources`, and each field given
+replaces the template's while a field left out keeps it. Environment
+variables apply as they do everywhere.
 
 ## Embedding
 

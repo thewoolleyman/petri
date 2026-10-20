@@ -427,6 +427,16 @@ impl SandboxExecutor {
                     .iter()
                     .map(|(key, value)| (key.to_string(), value.to_string())),
             );
+            // The run's size over the template's, field by field: a run that
+            // asks for more CPU keeps the template's memory unless it also
+            // asks for memory.
+            if let Some(requested) = &self.options.resources {
+                let resources = &mut spec.resources;
+                resources.cpu_cores = requested.cpu_cores.or(resources.cpu_cores);
+                resources.memory_mb = requested.memory_mb.or(resources.memory_mb);
+                resources.disk_mb = requested.disk_mb.or(resources.disk_mb);
+                resources.gpus = requested.gpus.or(resources.gpus);
+            }
             return Ok(spec);
         }
         if self.options.backend == SandboxBackend::Host

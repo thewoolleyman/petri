@@ -88,6 +88,10 @@ pub struct SandboxOptions {
     pub daytona_kind:      DaytonaSandboxKind,
     /// `None` leaves development mode to the environment and build profile.
     pub plugin_dev:        Option<bool>,
+    /// The run's sandbox size on a registered provider: each field given
+    /// here replaces the template's, and a field left out keeps it. The
+    /// built-in kinds ignore it; Daytona sizes from `daytona_resources`.
+    pub resources:         Option<Resources>,
 }
 
 /// The Daytona offering that hosts a workflow runner.

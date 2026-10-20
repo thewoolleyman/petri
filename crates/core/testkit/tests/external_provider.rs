@@ -14,7 +14,9 @@ use executor_sandbox::{
     ProviderRegistrations, RecordedLease, RoutingExecutor, SandboxOptions,
 };
 use ir::ScopeId;
-use sandbox_driver::{NetworkPolicy, ProviderKind, SandboxSource, SandboxSpec, WorkspaceOwnership};
+use sandbox_driver::{
+    NetworkPolicy, ProviderKind, Resources, SandboxSource, SandboxSpec, WorkspaceOwnership,
+};
 use sandbox_driver_protocol::PluginConfig;
 use testkit::RunDir;
 use testkit::in_process::{HostFactory, UnusedFactory};
@@ -542,4 +544,42 @@ async fn a_run_policy_must_match_the_template_or_leave_it_alone() {
         "the matching policy reached the provider"
     );
     same.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_run_sizes_its_sandbox_over_the_template_field_by_field() {
+    let dir = RunDir::new("external-resources");
+    let ledger = Arc::new(MemoryLedger::default());
+    let mut providers = ProviderRegistrations::new();
+    let mut sized = template(&dir);
+    sized.resources.cpu_cores = Some(1);
+    sized.resources.memory_mb = Some(1024);
+    sized.resources.disk_mb = Some(10_240);
+    providers
+        .register_plugin(plugin_config(&dir, Some("account-a"), KIND), sized)
+        .expect("a valid registration");
+    let mut requested = Resources::default();
+    requested.cpu_cores = Some(4);
+    requested.memory_mb = Some(8192);
+    let router = RoutingExecutor::with_options(dir.path(), Retention::Always, SandboxOptions {
+        backend: KIND.parse().expect("a valid kind"),
+        resources: Some(requested),
+        ..Default::default()
+    })
+    .with_providers(providers);
+    router.set_ledger(ledger.clone());
+    // Whether the fixture's host backend honours a size is its own affair;
+    // the spec it was asked to create is what Petri sent.
+    let _ = router
+        .acquire(&scope(), &AcquireContext::bare().with_lease(LEASE))
+        .await;
+    assert_eq!(count(&dir, "create"), 1);
+    let spec: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("backend/spec.json")).expect("the spec"))
+            .expect("spec JSON");
+    assert_eq!(spec["resources"]["cpu_cores"], 4, "the run's CPU");
+    assert_eq!(spec["resources"]["memory_mb"], 8192, "the run's memory");
+    assert_eq!(spec["resources"]["disk_mb"], 10_240, "the template's disk");
+    assert_eq!(spec["labels"]["custom-label"], "preserved");
+    router.shutdown().await;
 }
