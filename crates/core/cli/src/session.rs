@@ -74,9 +74,9 @@ impl SessionArgs {
         run_dir: &Path,
         default_retention: Option<WorkspaceRetention>,
         launch: &LaunchSettings,
-        provider: ProviderArgs,
+        provider: &ProviderArgs,
         runner: RunnerArgs,
-    ) -> RunOptions {
+    ) -> Result<RunOptions, String> {
         let mut options = RunOptions::new(run_dir);
         options.echo = !self.quiet;
         options.retention = self
@@ -85,12 +85,12 @@ impl SessionArgs {
             .map_or(options.retention, Retention::from);
         let backend_given = provider.backend_given();
         options.sandbox = provider.options();
-        if !backend_given
-            && let Some(backend) = launch.sandbox_backend.as_deref()
-            && let Ok(backend) = backend.parse::<SandboxBackend>()
-        {
-            // The frontend diagnosed any spelling it does not know.
-            options.sandbox.backend = backend;
+        if !backend_given && let Some(backend) = launch.sandbox_backend.as_deref() {
+            // The frontend validated the name; a spelling the host cannot
+            // place is an error here, never a silent fall back to the host.
+            options.sandbox.backend = backend
+                .parse::<SandboxBackend>()
+                .map_err(|error| format!("the workflow selects a sandbox backend: {error}"))?;
         }
         options.sandbox.runner_images = runner.images.into_iter().collect();
         options.sandbox.daytona_kind = runner.daytona_kind.unwrap_or(options.sandbox.daytona_kind);
@@ -100,7 +100,7 @@ impl SessionArgs {
             memory_mb: runner.daytona_memory_mb.unwrap_or(defaults.memory_mb),
             disk_mb:   runner.daytona_disk_mb.or(defaults.disk_mb),
         };
-        options
+        Ok(options)
     }
 
     /// How the session answers questions: the explicit option, else the

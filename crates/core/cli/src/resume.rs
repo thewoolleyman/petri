@@ -123,7 +123,14 @@ pub(crate) async fn resume(
     let controls = ControlService::new();
     let hooks = controls.hooks(rt.installed_hooks());
     let rt = rt.hooks(hooks).capability(controls.turns());
-    let options = args.run_options(&run_dir, default_retention, &launch, provider, runner);
+    let options = match args.run_options(&run_dir, default_retention, &launch, &provider, runner) {
+        Ok(options) => options,
+        Err(error) => return crate::provider_error(&error),
+    };
+    let rt = match provider.configure(rt.options(options)).await {
+        Ok(rt) => rt,
+        Err(error) => return crate::provider_error(&error),
+    };
     let answers = args.answers(&launch);
     if state.paused {
         eprintln!(
@@ -138,11 +145,5 @@ pub(crate) async fn resume(
     let start = Start::Resume {
         stall_timeout: graph.policy.stall_timeout,
     };
-    Box::pin(session::drive(
-        &rt.options(options),
-        &run_dir,
-        start,
-        session,
-    ))
-    .await
+    Box::pin(session::drive(&rt, &run_dir, start, session)).await
 }

@@ -781,7 +781,12 @@ providers instead hands the runtime a factory per kind
 its own process, launches no plugin (a kind without a factory fails at
 acquire), connects each one once per run and checks its health before any lease
 uses it. Both ways record the same fingerprint for the same backend, so a lease
-recorded one way is recovered or pruned the other. Finishing a run closes its
+recorded one way is recovered or pruned the other. A plugin of a kind Petri does
+not know can be registered beside them (`ProviderRegistrations`), with the
+`SandboxSpec` template its ordinary process scopes are built from; its plugin
+must report a resource identity, and its fingerprint is `<kind>:<identity>`.
+The router keeps one executor per provider kind, and resume, release, and
+prune reach each lease through the kind its record names. Finishing a run closes its
 admission to every environment it handed out, so a retained environment
 refuses work afterwards whichever way its provider is reached. The
 durable resource record (one line per transition in the run's resource log,

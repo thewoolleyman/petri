@@ -16,6 +16,9 @@ name = "cli"
 
 [dependencies]
 execution = { workspace = true }
+sandbox-driver = { workspace = true }
+sandbox-driver-protocol = { workspace = true }
+toml = { workspace = true }
 runtime = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }

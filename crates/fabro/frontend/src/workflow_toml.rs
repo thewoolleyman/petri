@@ -27,7 +27,8 @@
 //!   `daytona` the Daytona plugin) when `--backend` is not given;
 //!   `image.docker` is the scope's container image under those two; `env` is
 //!   the scope environment, with `{{ secrets.NAME }}` as a `$secret` reference
-//!   resolved at spawn; `resources` are the Daytona runner size. The other keys
+//!   resolved at spawn; `resources` are the Daytona runner size, or a
+//!   registered provider's sandbox size over its template. The other keys
 //!   Fabro's environment table accepts (`cwd`, `network`, `lifecycle`,
 //!   `labels`, `image.dockerfile`) are the Fabro platform's: known, read by
 //!   nothing here, and accepted silently in every layer, as `[workflow] engine`
@@ -911,19 +912,26 @@ impl Reader<'_> {
             .and_then(toml::Value::as_str)
             .unwrap_or("")
             .to_string();
-        if !matches!(provider.as_str(), "local" | "docker" | "daytona") {
+        // `local`, `docker` and `daytona` are the providers Petri places
+        // itself; any other valid kind names a provider the host registers,
+        // and is carried through as written. `simulated` is a dry run's.
+        if provider == "simulated"
+            || sandbox_driver::ProviderKind::try_new(provider.as_str()).is_err()
+        {
             let source = at(&format!("{base_table}.provider"));
             self.unsupported_in(
                 &source,
                 "workflow_toml.environments.provider",
                 format!(
                     "`[environments.{id}] provider = \"{provider}\"` in `{source}` is not \
-                     `local`, `docker` or `daytona`"
+                     `local`, `docker`, `daytona`, or a provider kind (lowercase letters, \
+                     digits, and interior hyphens)"
                 ),
-                "set the provider to `local`, `docker` or `daytona`",
+                "set the provider to `local`, `docker`, `daytona`, or a registered provider kind",
             );
             return;
         }
+        let built_in = matches!(provider.as_str(), "local" | "docker" | "daytona");
         // A field, with the table it was read from: the run's own table
         // over the named environment's.
         let field = |key: &str| {
@@ -932,6 +940,26 @@ impl Reader<'_> {
                 .map(|value| (value, "run.environment"))
                 .or_else(|| base.get(key).map(|value| (value, base_table.as_str())))
         };
+        // A registered provider is provisioned from its registration's
+        // template, so an image would be ignored and is refused instead.
+        // `resources` size the run's sandbox over the template's and are
+        // lowered below, as Daytona's are.
+        if !built_in {
+            for key in ["image"] {
+                if let Some((_, table)) = field(key) {
+                    self.unsupported_in(
+                        &at(&format!("{table}.{key}")),
+                        "workflow_toml.environments.custom",
+                        format!(
+                            "`[environments.{id}] provider = \"{provider}\"` is a registered \
+                             provider; `{key}` applies to `docker` and `daytona` only"
+                        ),
+                        "configure the provider's sandbox in its registration instead",
+                    );
+                    return;
+                }
+            }
+        }
         let mut environment = Environment {
             id:        id.clone(),
             provider:  provider.clone(),
@@ -965,7 +993,7 @@ impl Reader<'_> {
         if let Some((resources, table)) = field("resources")
             && let Some(resources) = resources.as_table()
         {
-            if provider == "daytona" {
+            if provider == "daytona" || !built_in {
                 environment.cpu_cores = resources
                     .get("cpu")
                     .and_then(toml::Value::as_integer)
