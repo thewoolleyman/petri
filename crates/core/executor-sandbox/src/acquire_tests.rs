@@ -376,3 +376,34 @@ async fn a_reused_sandbox_cannot_bypass_the_block_policy() {
         .await;
     fixture.assert_deleted().await;
 }
+
+#[tokio::test]
+async fn a_docker_backend_sends_the_runs_resources() {
+    let mut resources = sandbox_driver::Resources::default();
+    resources.cpu_cores = Some(4);
+    resources.memory_mb = Some(7629);
+    let mut fixture = Fixture::new(EnvironmentBehavior::Fail);
+    {
+        let options = &mut Arc::get_mut(&mut fixture.executor).unwrap().options;
+        options.backend = crate::SandboxBackend::Docker;
+        options.resources = Some(resources);
+    }
+    fixture.provider.allow_create.notify_one();
+    fixture
+        .acquire()
+        .await
+        .unwrap()
+        .expect_err("acquisition stops at the scripted boundary");
+    let request = fixture.provider.requests.lock().unwrap()[0].clone();
+    assert_eq!(
+        request.resources.cpu_cores,
+        Some(4),
+        "the run's CPU reaches Docker"
+    );
+    assert_eq!(
+        request.resources.memory_mb,
+        Some(7629),
+        "the run's memory reaches Docker"
+    );
+    fixture.assert_deleted().await;
+}

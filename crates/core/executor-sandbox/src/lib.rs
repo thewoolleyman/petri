@@ -430,13 +430,7 @@ impl SandboxExecutor {
             // The run's size over the template's, field by field: a run that
             // asks for more CPU keeps the template's memory unless it also
             // asks for memory.
-            if let Some(requested) = &self.options.resources {
-                let resources = &mut spec.resources;
-                resources.cpu_cores = requested.cpu_cores.or(resources.cpu_cores);
-                resources.memory_mb = requested.memory_mb.or(resources.memory_mb);
-                resources.disk_mb = requested.disk_mb.or(resources.disk_mb);
-                resources.gpus = requested.gpus.or(resources.gpus);
-            }
+            apply_requested_resources(&mut spec.resources, self.options.resources.as_ref());
             return Ok(spec);
         }
         if self.options.backend == SandboxBackend::Host
@@ -464,7 +458,7 @@ impl SandboxExecutor {
             return Ok(spec);
         }
         if self.options.backend != SandboxBackend::Daytona {
-            if self.options.backend == SandboxBackend::Docker
+            let mut spec = if self.options.backend == SandboxBackend::Docker
                 && matches!(scope.runtime.target, RuntimeTarget::HostProcess)
             {
                 let mut runner = scope.clone();
@@ -473,9 +467,16 @@ impl SandboxExecutor {
                     options:     ContainerOptions::default(),
                     credentials: None,
                 };
-                return build_spec(&runner, labels, name, ctx);
+                build_spec(&runner, labels, name, ctx)?
+            } else {
+                build_spec(scope, labels, name, ctx)?
+            };
+            // A Docker container sandbox carries the run's size too; without it
+            // the container runs with no CPU or memory limit at all.
+            if self.options.backend == SandboxBackend::Docker {
+                apply_requested_resources(&mut spec.resources, self.options.resources.as_ref());
             }
-            return build_spec(scope, labels, name, ctx);
+            return Ok(spec);
         }
         let image = self.options.runner_image(&scope.runtime)?;
         let snapshot = RunnerSnapshot::new(
@@ -792,5 +793,19 @@ impl Executor for SandboxExecutor {
             .await;
         report.merge(ended);
         report
+    }
+}
+
+/// The run's size over a spec's own, field by field: a run that asks for more
+/// CPU keeps the spec's memory unless it also asks for memory.
+fn apply_requested_resources(
+    resources: &mut sandbox_driver::Resources,
+    requested: Option<&sandbox_driver::Resources>,
+) {
+    if let Some(requested) = requested {
+        resources.cpu_cores = requested.cpu_cores.or(resources.cpu_cores);
+        resources.memory_mb = requested.memory_mb.or(resources.memory_mb);
+        resources.disk_mb = requested.disk_mb.or(resources.disk_mb);
+        resources.gpus = requested.gpus.or(resources.gpus);
     }
 }
