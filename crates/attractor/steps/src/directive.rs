@@ -47,14 +47,29 @@ pub enum DirectiveError {
 }
 
 /// Every top-level JSON object in `text`, outermost only, as slices.
+///
+/// An opening brace that never closes (prose quoting a lone `{`) must not
+/// swallow every object after it: when the scan ends with an object still
+/// open, it resumes one byte past that object's opening brace, so the stray
+/// brace costs only itself and a trailing routing object is still found.
 fn json_objects(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(unclosed) = scan_objects(text, from, &mut out) {
+        from = unclosed + 1;
+    }
+    out
+}
+
+/// Scan `text` from byte `from`, pushing each complete top-level object onto
+/// `out`. Returns the start of an object still open at the end, if any.
+fn scan_objects<'a>(text: &'a str, from: usize, out: &mut Vec<&'a str>) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0_usize;
     let mut start = None;
     let mut in_string = false;
     let mut escaped = false;
-    for (index, byte) in bytes.iter().enumerate() {
+    for (index, byte) in bytes.iter().enumerate().skip(from) {
         if in_string {
             if escaped {
                 escaped = false;
@@ -86,7 +101,7 @@ fn json_objects(text: &str) -> Vec<&str> {
             _ => {}
         }
     }
-    out
+    start
 }
 
 /// The last complete top-level JSON object in `text`.
@@ -202,6 +217,21 @@ mod tests {
             parse(r#"{"outcome": "failed", "preferred_next_label": "[F] Fix"}"#).expect("parses");
         assert_eq!(first.outcome, Some(StageOutcome::Failed));
         assert_eq!(first.preferred_label.as_deref(), Some("Fix"));
+    }
+
+    #[test]
+    fn an_unbalanced_brace_in_prose_does_not_hide_the_trailing_label() {
+        // The misrouted review (bd-ib-7smzwo): prose quoting two lone opening
+        // braces, then the label object the review contract asks for.
+        let text = r#"The opener is built as "{" + "{" in the test, which is fine.
+        Advisory only.
+        {"preferred_next_label": "approve"}"#;
+        let directive = parse(text).expect("parses");
+        assert_eq!(directive.preferred_label.as_deref(), Some("approve"));
+        assert_eq!(
+            parse(r#"Quoting "{" alone, and no label object."#).expect_err("missing"),
+            DirectiveError::Missing
+        );
     }
 
     #[test]
