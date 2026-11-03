@@ -16,8 +16,14 @@
 //! The watchdog does not wake on every event (a busy agent emits one per
 //! stream delta). It sleeps until its deadline, re-reads the last activity
 //! when it wakes, and re-arms when the run was active in the meantime.
+//!
+//! It reads time through a [`WatchdogClock`]: tokio's clock by default, or an
+//! injected one, so a host's tests can decide exactly how much time passes
+//! without depending on the host's load or the wall clock.
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -33,6 +39,97 @@ use crate::{
     CancelReason, CoordinatorEvent, CoordinatorHandle, CoordinatorRecord, CoordinatorState,
     ExecutionId, ExecutionObserver,
 };
+
+/// The time source the watchdog measures inactivity against.
+pub trait WatchdogClock: Send + Sync {
+    /// The current instant.
+    fn now(&self) -> Instant;
+    /// Complete once [`now`](Self::now) has reached `deadline`.
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// Tokio's clock: the production default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokioClock;
+
+impl WatchdogClock for TokioClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(sleep_until(deadline))
+    }
+}
+
+/// A clock that moves only when [`advance`](Self::advance) moves it: for
+/// tests whose verdict must not depend on how long the host takes.
+#[derive(Clone)]
+pub struct ManualClock {
+    inner: Arc<ManualInner>,
+}
+
+struct ManualInner {
+    origin:  Instant,
+    elapsed: Mutex<Duration>,
+    moved:   Notify,
+}
+
+impl ManualClock {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ManualInner {
+                origin:  Instant::now(),
+                elapsed: Mutex::new(Duration::ZERO),
+                moved:   Notify::new(),
+            }),
+        }
+    }
+
+    /// Move the clock forward by `by`, waking every sleeper whose deadline
+    /// it reaches.
+    pub fn advance(&self, by: Duration) {
+        *self
+            .inner
+            .elapsed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += by;
+        self.inner.moved.notify_waiters();
+    }
+}
+
+impl Default for ManualClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WatchdogClock for ManualClock {
+    fn now(&self) -> Instant {
+        self.inner.origin
+            + *self
+                .inner
+                .elapsed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                let moved = self.inner.moved.notified();
+                tokio::pin!(moved);
+                // Register before reading the time, so an advance between
+                // the read and the await is not missed.
+                moved.as_mut().enable();
+                if self.now() >= deadline {
+                    return;
+                }
+                moved.await;
+            }
+        })
+    }
+}
 
 /// Why the watchdog cancelled the run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +158,7 @@ impl State {
 }
 
 struct Inner {
+    clock:   Arc<dyn WatchdogClock>,
     timeout: Duration,
     state:   Mutex<State>,
     changed: Notify,
@@ -85,11 +183,18 @@ pub struct StallWatchdog {
 
 impl StallWatchdog {
     pub fn new(timeout: Duration) -> Self {
+        Self::with_clock(timeout, Arc::new(TokioClock))
+    }
+
+    /// A watchdog that measures inactivity on `clock` instead of tokio's.
+    pub fn with_clock(timeout: Duration, clock: Arc<dyn WatchdogClock>) -> Self {
+        let now = clock.now();
         Self {
             inner: Arc::new(Inner {
+                clock,
                 timeout,
                 state: Mutex::new(State {
-                    last_activity: Instant::now(),
+                    last_activity: now,
                     pending:       BTreeSet::new(),
                     paused:        false,
                     tripped:       None,
@@ -111,7 +216,7 @@ impl StallWatchdog {
 
     /// Start the monitor task. `cancel` is called once when the run stalls.
     pub fn start(&self, handle: CoordinatorHandle) -> WatchdogTask {
-        self.inner.state().last_activity = Instant::now();
+        self.inner.state().last_activity = self.inner.clock.now();
         let inner = self.inner.clone();
         let stop = self.stop.clone();
         let task = tokio::spawn(async move {
@@ -135,7 +240,7 @@ impl StallWatchdog {
     }
 
     fn touch(&self) {
-        self.inner.state().last_activity = Instant::now();
+        self.inner.state().last_activity = self.inner.clock.now();
     }
 
     fn block(&self, execution: ExecutionId, question: String) {
@@ -158,7 +263,7 @@ impl StallWatchdog {
         }
         state.paused = paused;
         if !paused {
-            state.last_activity = Instant::now();
+            state.last_activity = self.inner.clock.now();
         }
         drop(state);
         tracing::debug!(paused, "stall watchdog follows the run's pause");
@@ -172,7 +277,7 @@ impl StallWatchdog {
         }
         if state.pending.is_empty() {
             // Unblocking restarts the full budget.
-            state.last_activity = Instant::now();
+            state.last_activity = self.inner.clock.now();
             drop(state);
             tracing::debug!("stall watchdog resumed with a full budget");
             self.inner.changed.notify_one();
@@ -213,12 +318,12 @@ async fn monitor(inner: Arc<Inner>, stop: CancellationToken, cancel: impl Fn(Sta
             biased;
             () = stop.cancelled() => return,
             () = inner.changed.notified() => {}
-            () = sleep_until(deadline), if !blocked => {
+            () = inner.clock.sleep_until(deadline), if !blocked => {
                 let mut state = inner.state();
                 if state.parked() {
                     continue;
                 }
-                let idle = state.last_activity.elapsed();
+                let idle = inner.clock.now().saturating_duration_since(state.last_activity);
                 if idle < inner.timeout {
                     // Active in the meantime: re-arm from the newer activity.
                     continue;
@@ -441,6 +546,46 @@ mod tests {
         advance(Duration::from_secs(600)).await;
         assert_eq!(fired.load(Ordering::SeqCst), 0);
         assert!(watchdog.tripped().is_none());
+    }
+
+    /// An injected clock is the only time the watchdog sees: tokio's clock
+    /// racing ahead changes nothing, and the manual clock alone decides.
+    #[tokio::test(start_paused = true)]
+    async fn a_manual_clock_alone_decides_the_stall() {
+        let clock = ManualClock::new();
+        let watchdog = StallWatchdog::with_clock(Duration::from_secs(1), Arc::new(clock.clone()));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let task = run_monitor(watchdog.inner.clone(), watchdog.stop.clone(), fired.clone());
+        advance(Duration::from_secs(600)).await;
+        yield_now().await;
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "tokio time is not the watchdog's"
+        );
+        for _ in 0..10 {
+            clock.advance(Duration::from_millis(900));
+            watchdog.touch();
+            yield_now().await;
+        }
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "activity inside each budget"
+        );
+        clock.advance(Duration::from_millis(999));
+        yield_now().await;
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "one millisecond short");
+        clock.advance(Duration::from_millis(1));
+        task.await.expect("fires at the budget");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            watchdog.tripped(),
+            Some(StallTimeout {
+                stall_timeout_ms: 1000,
+                idle_ms:          1000,
+            })
+        );
     }
 
     /// A monitor whose task handle is dropped (a crashed host) ends with
