@@ -24,3 +24,7 @@ smol_str = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# A paused clock drives the drain tests, so their verdict never depends on load.
+tokio = { workspace = true, features = ["test-util"] }

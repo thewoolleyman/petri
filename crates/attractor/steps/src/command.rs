@@ -4,7 +4,7 @@
 //! object of the output read as a routing directive.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::Ordering;
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -280,22 +280,23 @@ async fn execute(config: CommandConfig, mut ctx: StepCtx) -> Result<Outcome, Ste
         });
     }
     let captured = Arc::new(Mutex::new(OutputTail::default()));
-    let forwarder = handle.lines().map(|mut lines| {
+    let forwarder = handle.lines().map(|lines| {
         let logs = ctx.logs.clone();
         let captured = captured.clone();
-        Forwarder::spawn(move |forwarded| async move {
-            while let Some(line) = lines.recv().await {
-                captured
-                    .lock()
-                    .expect("the output tail lock is not poisoned")
-                    .push_line(&line.line, line.terminated, line.dropped);
+        Forwarder::spawn(lines, move |line| {
+            captured
+                .lock()
+                .expect("the output tail lock is not poisoned")
+                .push_line(&line.line, line.terminated, line.dropped);
+            let logs = logs.clone();
+            async move {
                 let _ = logs
                     .send(StepEvent::Log {
                         stream: LogStream::Stdout,
                         line:   line.line,
                     })
                     .await;
-                forwarded.fetch_add(1, Ordering::Relaxed);
+                ControlFlow::Continue(())
             }
         })
     });

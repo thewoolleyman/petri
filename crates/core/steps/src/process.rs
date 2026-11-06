@@ -5,8 +5,8 @@
 //! executor, and never assumes the workspace is on this machine.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use executor::{ExitStatus, LogLine, ProcessSpec, Sig, StdinMode};
@@ -21,9 +21,8 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use crate::ctx::{Step, StepCtx, StepFailure};
-use crate::drain::{DRAIN_IDLE_LIMIT, Drain, Forwarded, Forwarder};
+use crate::drain::{DRAIN_IDLE_LIMIT, Drain, Forwarder};
 use crate::outputs::{BAD_OUTPUT_CLASS, parse};
-use crate::progress::ProgressSender;
 
 /// The step kind id the process step registers under.
 pub const PROCESS_KIND: StepKindId = StepKindId::new_static("process");
@@ -257,7 +256,16 @@ pub async fn run_resolved(
     // cancelled step's final output is not lost.
     let forwarder = handle.lines().map(|lines| {
         let logs = ctx.logs.clone();
-        Forwarder::spawn(move |forwarded| forward_lines(lines, logs, forwarded))
+        Forwarder::spawn(lines, move |LogLine { stream, line, .. }| {
+            let logs = logs.clone();
+            async move {
+                if logs.send(StepEvent::Log { stream, line }).await.is_err() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+        })
     });
 
     let grace = ctx.env.grace();
@@ -427,15 +435,6 @@ pub(crate) fn natural_outcome(status: &ExitStatus, soft_fail: &SoftFail, output:
         Outcome::new(Status::partial(failure), output)
     } else {
         Outcome::new(Status::Failure(failure), output)
-    }
-}
-
-async fn forward_lines(mut lines: executor::LineStream, out: ProgressSender, forwarded: Forwarded) {
-    while let Some(LogLine { stream, line, .. }) = lines.recv().await {
-        if out.send(StepEvent::Log { stream, line }).await.is_err() {
-            return;
-        }
-        forwarded.fetch_add(1, Ordering::Relaxed);
     }
 }
 
