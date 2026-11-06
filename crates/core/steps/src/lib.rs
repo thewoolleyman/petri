@@ -15,7 +15,7 @@ pub mod question;
 
 pub use caps::{CAPABILITY_UNAVAILABLE_CLASS, Capabilities, CapabilitiesBuilder};
 pub use ctx::{Registry, Step, StepCtx, StepFailure, StepRunner};
-pub use drain::{DRAIN_IDLE_LIMIT, Drain, Forwarded, Forwarder};
+pub use drain::{DRAIN_IDLE_LIMIT, Drain, Forwarder};
 pub use noop::{NOOP_KIND, NoopStep};
 pub use outputs::{BAD_OUTPUT_CLASS, OutputError, parse as parse_outputs};
 pub use process::{

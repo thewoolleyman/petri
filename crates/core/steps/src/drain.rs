@@ -11,21 +11,18 @@
 //! output as possibly incomplete.
 
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 
 /// How long a post-exit drain waits for the next forwarded line before it
 /// gives up.
 pub const DRAIN_IDLE_LIMIT: Duration = Duration::from_secs(5);
-
-/// The count of lines a [`Forwarder`] has passed on. The forwarding future
-/// bumps it once per line; the drain reads it to tell arriving output from
-/// silence.
-pub type Forwarded = Arc<AtomicU64>;
 
 /// How a forwarder's drain ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,25 +36,35 @@ pub enum Drain {
     Silent,
 }
 
-/// A spawned task forwarding one process's output, with the count of lines
-/// it has passed on.
+/// A spawned task forwarding one process's output stream, with the count of
+/// lines it has passed on.
 #[must_use = "call `finish` once the process is gone, so the forwarded output is drained"]
 pub struct Forwarder {
     task:     JoinHandle<()>,
-    progress: Forwarded,
+    progress: Arc<AtomicU64>,
 }
 
 impl Forwarder {
-    /// Spawn the forwarding future. It receives the progress counter and
-    /// bumps it once per line it passes on; the count is what lets
+    /// Spawn a task that receives each line of `stream` and hands it to
+    /// `forward`, until the stream closes or `forward` breaks. The task
+    /// counts the lines it has passed on, which is what lets
     /// [`Self::finish`] tell a slow consumer from a silent stream.
-    pub fn spawn<F, Fut>(forward: F) -> Self
+    pub fn spawn<T, F, Fut>(mut stream: mpsc::Receiver<T>, mut forward: F) -> Self
     where
-        F: FnOnce(Forwarded) -> Fut,
-        Fut: Future<Output = ()> + Send + 'static,
+        T: Send + 'static,
+        F: FnMut(T) -> Fut + Send + 'static,
+        Fut: Future<Output = ControlFlow<()>> + Send + 'static,
     {
-        let progress = Forwarded::default();
-        let task = tokio::spawn(forward(Arc::clone(&progress)));
+        let progress = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&progress);
+        let task = tokio::spawn(async move {
+            while let Some(item) = stream.recv().await {
+                if forward(item).await.is_break() {
+                    return;
+                }
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         Self { task, progress }
     }
 
@@ -86,36 +93,53 @@ impl Forwarder {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::time::Instant;
 
-    use tokio::sync::mpsc;
+    use tokio::time::Instant;
 
     use super::*;
+
+    /// A forwarder that records every line it is handed, after `delay(line)`.
+    fn recording(
+        rx: mpsc::Receiver<u64>,
+        delay: impl Fn(u64) -> Duration + Send + 'static,
+    ) -> (Forwarder, Arc<Mutex<Vec<u64>>>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let forwarder = Forwarder::spawn(rx, move |n| {
+            let sink = Arc::clone(&sink);
+            let pause = delay(n);
+            async move {
+                time::sleep(pause).await;
+                sink.lock().expect("not poisoned").push(n);
+                ControlFlow::Continue(())
+            }
+        });
+        (forwarder, received)
+    }
+
+    /// A stream of `total` lines, already queued and closed: the process
+    /// that wrote them is gone.
+    async fn exited_process_lines(total: u64) -> mpsc::Receiver<u64> {
+        let (tx, rx) = mpsc::channel(usize::try_from(total).expect("fits"));
+        for n in 1..=total {
+            tx.send(n).await.expect("room for every line");
+        }
+        rx
+    }
 
     /// Modelled on sandbox-driver's
     /// `a_slow_consumer_receives_every_byte_after_the_process_exits`: the
     /// stream already holds every line when the drain starts, the consumer
     /// takes far longer than the idle limit to absorb them all, and none is
     /// lost.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slow_consumer_receives_every_line_after_the_process_exits() {
         let idle = Duration::from_millis(100);
         let total: u64 = 40;
-        let (tx, mut rx) = mpsc::channel(usize::try_from(total).expect("fits"));
-        for n in 1..=total {
-            tx.send(n).await.expect("room for every line");
-        }
-        drop(tx);
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&received);
-        let forwarder = Forwarder::spawn(move |progress| async move {
-            while let Some(n) = rx.recv().await {
-                // Each line takes a fifth of the idle limit; the whole stream
-                // takes eight times the limit.
-                time::sleep(Duration::from_millis(20)).await;
-                sink.lock().expect("not poisoned").push(n);
-                progress.fetch_add(1, Ordering::Relaxed);
-            }
+        // Each line takes a fifth of the idle limit; the whole stream takes
+        // eight times the limit.
+        let (forwarder, received) = recording(exited_process_lines(total).await, |_| {
+            Duration::from_millis(20)
         });
         let started = Instant::now();
         assert_eq!(forwarder.finish(idle).await, Drain::Complete);
@@ -124,17 +148,30 @@ mod tests {
         assert_eq!(received, (1..=total).collect::<Vec<_>>());
     }
 
+    /// The consumer holds ONE line for longer than the idle limit after the
+    /// process is gone: the forwarder is waiting on its consumer, not on a
+    /// silent stream, so the drain keeps going and no line is lost. This is
+    /// a loaded run whose log consumer stalls on one record; it must not
+    /// cost the output's tail.
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_stalled_past_the_limit_on_one_line_loses_no_line() {
+        let idle = Duration::from_millis(100);
+        let total: u64 = 3;
+        let (forwarder, received) = recording(exited_process_lines(total).await, move |n| {
+            if n == 1 { idle * 3 } else { Duration::ZERO }
+        });
+        assert_eq!(forwarder.finish(idle).await, Drain::Complete);
+        let received = received.lock().expect("not poisoned").clone();
+        assert_eq!(received, (1..=total).collect::<Vec<_>>());
+    }
+
     /// A stream held open with nothing arriving ends the drain after the
     /// idle limit and reports it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_silent_open_stream_ends_the_drain_after_the_limit() {
         let idle = Duration::from_millis(100);
-        let (tx, mut rx) = mpsc::channel::<u64>(1);
-        let forwarder = Forwarder::spawn(move |progress| async move {
-            while rx.recv().await.is_some() {
-                progress.fetch_add(1, Ordering::Relaxed);
-            }
-        });
+        let (tx, rx) = mpsc::channel::<u64>(1);
+        let (forwarder, _) = recording(rx, |_| Duration::ZERO);
         let started = Instant::now();
         assert_eq!(forwarder.finish(idle).await, Drain::Silent);
         let elapsed = started.elapsed();
@@ -145,15 +182,11 @@ mod tests {
 
     /// A stream that goes quiet after forwarding some lines is drained for
     /// one more idle period after the last line, then reported silent.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn output_then_silence_re_arms_once_and_then_ends() {
         let idle = Duration::from_millis(100);
-        let (tx, mut rx) = mpsc::channel::<u64>(4);
-        let forwarder = Forwarder::spawn(move |progress| async move {
-            while rx.recv().await.is_some() {
-                progress.fetch_add(1, Ordering::Relaxed);
-            }
-        });
+        let (tx, rx) = mpsc::channel::<u64>(4);
+        let (forwarder, received) = recording(rx, |_| Duration::ZERO);
         let feeder = tokio::spawn(async move {
             time::sleep(Duration::from_millis(60)).await;
             let _ = tx.send(1).await;
@@ -165,6 +198,7 @@ mod tests {
         assert_eq!(forwarder.finish(idle).await, Drain::Silent);
         let elapsed = started.elapsed();
         assert!(elapsed >= idle * 2 && elapsed < idle * 10, "{elapsed:?}");
+        assert_eq!(*received.lock().expect("not poisoned"), vec![1]);
         feeder.abort();
     }
 }
